@@ -22,7 +22,7 @@ const {
   StreamType
 } = require('@discordjs/voice');
 
-// --- WEB SERVER KEEP-ALIVE ---
+// --- WEB SERVER (RAILWAY HEALTHCHECK) ---
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -53,7 +53,7 @@ const RADIO_STATIONS = {
   hardrock: { name: 'Hard Rock FM', url: 'https://stream.zeno.fm/u2213718v8zuv' }
 };
 
-// Fungsi Pemutar Stream URL via FFmpeg
+// Fungsi Pemutar Stream URL via FFmpeg Transcoder
 function createStreamResource(streamUrl) {
   const ffmpeg = new prism.FFmpeg({
     args: [
@@ -78,11 +78,11 @@ function createStreamResource(streamUrl) {
 }
 
 player.on(AudioPlayerStatus.Playing, () => {
-  console.log('🎶 Audio Player: Sedang memutar suara ke Voice Channel.');
+  console.log('🎶 Audio Player: Sedang memutar suara.');
 });
 
 player.on(AudioPlayerStatus.Idle, () => {
-  console.log('⏹️ Audio Player: Idle / selesai.');
+  console.log('⏹️ Audio Player: Selesai / idle.');
 });
 
 player.on('error', error => {
@@ -93,11 +93,11 @@ client.once('ready', () => {
   console.log(`✅ Logged in as ${client.user.tag}!`);
 });
 
-// --- PERINTAH BOT ---
+// --- PERINTAH DISCORD ---
 client.on('messageCreate', async message => {
   if (message.author.bot || !message.guild) return;
 
-  // 1. PUTAR RADIO (!radio lofi atau !radio prambors)
+  // 1. PUTAR RADIO (!radio lofi)
   if (message.content.startsWith('!radio')) {
     const args = message.content.split(' ').slice(1);
     const stationKey = args[0] ? args[0].toLowerCase() : null;
@@ -125,6 +125,15 @@ client.on('messageCreate', async message => {
       });
 
       currentConnection = connection;
+
+      // Debugging suara agar terpantau di Deploy Logs Railway
+      connection.on('stateChange', (oldState, newState) => {
+        console.log(`📡 Voice State: ${oldState.status} -> ${newState.status}`);
+      });
+      connection.on('debug', msg => {
+        console.log(`🔍 Voice Debug: ${msg}`);
+      });
+
       await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
 
       const resource = createStreamResource(station.url);
@@ -134,68 +143,35 @@ client.on('messageCreate', async message => {
       return message.reply(`📻 Sedang memutar siaran: **${station.name}** di channel **${voiceChannel.name}**! 🔊`);
     } catch (err) {
       console.error('Error saat koneksi radio:', err);
+      if (currentConnection) {
+        currentConnection.destroy();
+        currentConnection = null;
+      }
       return message.reply('⚠️ Terjadi error saat menghubungkan audio ke voice channel.');
     }
   }
 
-  // 2. PUTAR STREAM MP3 URL BEBAS (!play <url>)
-  if (message.content.startsWith('!play')) {
-    const args = message.content.split(' ').slice(1);
-    const targetUrl = args[0];
-
-    if (!targetUrl || !targetUrl.startsWith('http')) {
-      return message.reply('⚠️ Gunakan format: `!play <URL_MP3_STREAM>` atau gunakan `!radio` untuk siaran radio.');
-    }
-
-    const voiceChannel = message.member.voice.channel;
-    if (!voiceChannel) {
-      return message.reply('⚠️ Kamu harus masuk ke salah satu Voice Channel terlebih dahulu!');
-    }
-
-    try {
-      const connection = joinVoiceChannel({
-        channelId: voiceChannel.id,
-        guildId: message.guild.id,
-        adapterCreator: message.guild.voiceAdapterCreator,
-        selfDeaf: true,
-        selfMute: false
-      });
-
-      currentConnection = connection;
-      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-
-      const resource = createStreamResource(targetUrl);
-      player.play(resource);
-      connection.subscribe(player);
-
-      return message.reply(`🎵 Memutar audio stream di **${voiceChannel.name}**! 🔊`);
-    } catch (err) {
-      console.error('Error audio:', err);
-      return message.reply('⚠️ Terjadi error saat memutar audio.');
-    }
-  }
-
-  // 3. STOP
+  // 2. STOP (!stop)
   if (message.content === '!stop') {
     player.stop();
     if (currentConnection) {
       currentConnection.destroy();
       currentConnection = null;
     }
-    return message.reply('⏹️ Audio dihentikan dan bot keluar dari Voice Channel.');
+    return message.reply('⏹️ Musik dihentikan dan bot keluar dari Voice Channel.');
   }
 
-  // 4. PAUSE / RESUME
+  // 3. PAUSE / RESUME
   if (message.content === '!pause') {
     player.pause();
-    return message.reply('⏸️ Audio dijeda.');
+    return message.reply('⏸️ Musik dijeda.');
   }
   if (message.content === '!resume') {
     player.unpause();
-    return message.reply('▶️ Melanjutkan audio.');
+    return message.reply('▶️ Melanjutkan musik.');
   }
 
-  // 5. SETUP VERIFIKASI (Admin)
+  // 4. SETUP VERIFIKASI (Admin)
   if (message.content === '!setup-verify') {
     if (!message.member.permissions.has('Administrator')) {
       return message.reply('❌ Kamu harus Administrator untuk perintah ini.');

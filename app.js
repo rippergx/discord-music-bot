@@ -6,6 +6,7 @@ const http = require('http');
 const https = require('https');
 const path = require('path');
 const fs = require('fs');
+const prism = require('prism-media');
 const {
   Client,
   GatewayIntentBits,
@@ -28,7 +29,7 @@ const {
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('🎵 Discord Music Bot Online 24/7 on Railway!');
+  res.end('🎵 Discord Music Player with Seek & Playlist Online 24/7!');
 }).listen(PORT, () => {
   console.log(`🚀 Web server running on port ${PORT}`);
 });
@@ -49,14 +50,38 @@ const player = createAudioPlayer();
 let musicQueue = [];
 let currentTrack = null;
 let activeTextChannel = null;
-
-// Pengaturan Loop & Shuffle
-let isLoopQueue = true; // Default ON agar playlist memutar ulang terus menerus
+let lastPlayerMessage = null;
+let isLoopQueue = true;
 
 // Direktori Musik
 const MUSIC_DIR = path.join(__dirname, 'Music');
 if (!fs.existsSync(MUSIC_DIR)) {
   fs.mkdirSync(MUSIC_DIR, { recursive: true });
+}
+
+// Format Waktu (Detik -> MM:SS)
+function formatTime(seconds) {
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60);
+  return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+}
+
+// Parse Waktu (01:30 atau 90 -> Detik)
+function parseTimeToSeconds(timeStr) {
+  if (!timeStr) return null;
+  const parts = timeStr.split(':').map(Number);
+  if (parts.some(isNaN)) return null;
+  if (parts.length === 1) return parts[0];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  return null;
+}
+
+// Ambil Posisi Waktu Saat Ini
+function getCurrentPlaybackSeconds() {
+  if (!currentTrack || !currentTrack.startedAt) return 0;
+  const elapsed = (Date.now() - currentTrack.startedAt) / 1000;
+  return Math.max(0, (currentTrack.seekOffset || 0) + elapsed);
 }
 
 // 1. Ambil Semua Playlist Folder
@@ -87,7 +112,7 @@ function findSingleSong(query) {
   return null;
 }
 
-// 3. Fungsi Acak Lagu (Shuffle)
+// 3. Acak Lagu (Shuffle)
 function shuffleArray(array) {
   for (let i = array.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -103,7 +128,7 @@ const RADIO_STATIONS = {
   hardrock: { name: 'Hard Rock FM', url: 'https://stream.zeno.fm/u2213718v8zuv' }
 };
 
-// Stream Fetcher untuk Radio / URL (Mendukung Redirect HTTP 302)
+// Stream Fetcher untuk Radio / URL
 function fetchAudioStream(url, callback) {
   const lib = url.startsWith('https') ? https : http;
   lib.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, res => {
@@ -114,14 +139,109 @@ function fetchAudioStream(url, callback) {
   }).on('error', err => console.error('Stream Error:', err.message));
 }
 
-// Fungsi Memutar Lagu Berikutnya di Antrean
+// FUNGSI SEEK KE DETIK TERTENTU
+function executeSeek(targetSeconds) {
+  if (!currentTrack || currentTrack.type !== 'file') return false;
+
+  currentTrack.seekOffset = Math.max(0, targetSeconds);
+  currentTrack.startedAt = Date.now();
+
+  const ffmpeg = new prism.FFmpeg({
+    args: [
+      '-ss', String(currentTrack.seekOffset),
+      '-i', currentTrack.path,
+      '-analyzeduration', '0',
+      '-loglevel', '0',
+      '-f', 's16le',
+      '-ar', '48000',
+      '-ac', '2'
+    ]
+  });
+
+  const resource = createAudioResource(ffmpeg, {
+    inputType: StreamType.Raw,
+    inlineVolume: true
+  });
+  if (resource.volume) resource.volume.setVolume(0.8);
+
+  player.play(resource);
+  sendPlayerCard(currentTrack, false);
+  return true;
+}
+
+// --- TAMPILAN MODERN MUSIC PLAYER CARD ---
+function buildPlayerEmbed(track, isPaused = false) {
+  const currentPos = formatTime(getCurrentPlaybackSeconds());
+
+  return new EmbedBuilder()
+    .setColor('#5865F2')
+    .setAuthor({
+      name: 'MUSIC PLAYER CONTROLLER',
+      iconURL: client.user.displayAvatarURL()
+    })
+    .setTitle(`🎶 ${track.title}`)
+    .setDescription(
+      `⏱️ Posisi: \`${currentPos}\` ${track.type === 'file' ? '(Gunakan !seek untuk melompat)' : '(Live Stream)'}\n` +
+      `🔘▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ 24/7\n\n` +
+      `**Status:** ${isPaused ? '⏸️ Dijeda' : '▶️ Sedang Berputar'}\n` +
+      `**Mode Loop:** ${isLoopQueue ? '🔁 Aktif' : '➡️ Sekali Putar'}\n` +
+      `**Sisa Antrean:** \`${musicQueue.length}\` lagu`
+    )
+    .setFooter({ text: 'Gunakan tombol kontrol atau ketik !seek <menit:detik>' });
+}
+
+function buildPlayerButtons(isPaused = false) {
+  // Baris 1: Kontrol Navigasi Waktu & Play/Pause
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('btn_player_rewind10').setLabel('-10s').setStyle(ButtonStyle.Secondary).setEmoji('⏪'),
+    new ButtonBuilder().setCustomId('btn_player_playpause').setEmoji(isPaused ? '▶️' : '⏸️').setStyle(isPaused ? ButtonStyle.Success : ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('btn_player_forward10').setLabel('+10s').setStyle(ButtonStyle.Secondary).setEmoji('⏩'),
+    new ButtonBuilder().setCustomId('btn_player_skip').setEmoji('⏭️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('btn_player_stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger)
+  );
+
+  // Baris 2: Mode Shuffle & Loop
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('btn_player_shuffle').setEmoji('🔀').setLabel('Shuffle').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('btn_player_loop').setEmoji('🔁').setLabel('Loop').setStyle(isLoopQueue ? ButtonStyle.Primary : ButtonStyle.Secondary)
+  );
+
+  return [row1, row2];
+}
+
+async function sendPlayerCard(track, isPaused = false) {
+  if (!activeTextChannel) return;
+  const embed = buildPlayerEmbed(track, isPaused);
+  const rows = buildPlayerButtons(isPaused);
+
+  try {
+    if (lastPlayerMessage) {
+      await lastPlayerMessage.delete().catch(() => {});
+    }
+    lastPlayerMessage = await activeTextChannel.send({ embeds: [embed], components: rows });
+  } catch (err) {
+    console.error('Error kirim player card:', err);
+  }
+}
+
+// Memutar Lagu Berikutnya di Antrean
 function playNextSong() {
   if (musicQueue.length === 0) {
     currentTrack = null;
+    if (lastPlayerMessage) {
+      const finishedEmbed = new EmbedBuilder()
+        .setColor('#2b2d31')
+        .setTitle('⏹️ Pemutaran Selesai')
+        .setDescription('Semua antrean lagu telah habis.');
+      lastPlayerMessage.edit({ embeds: [finishedEmbed], components: [] }).catch(() => {});
+      lastPlayerMessage = null;
+    }
     return;
   }
 
   currentTrack = musicQueue.shift();
+  currentTrack.startedAt = Date.now();
+  currentTrack.seekOffset = 0;
 
   if (currentTrack.type === 'file') {
     const resource = createAudioResource(fs.createReadStream(currentTrack.path), {
@@ -130,10 +250,7 @@ function playNextSong() {
     });
     if (resource.volume) resource.volume.setVolume(0.8);
     player.play(resource);
-
-    if (activeTextChannel) {
-      activeTextChannel.send(`🎶 Sekarang memutar: **${currentTrack.title}** 🔊`).catch(() => {});
-    }
+    sendPlayerCard(currentTrack, false);
   } else if (currentTrack.type === 'stream') {
     fetchAudioStream(currentTrack.url, stream => {
       const resource = createAudioResource(stream, {
@@ -142,15 +259,11 @@ function playNextSong() {
       });
       player.play(resource);
     });
-    if (activeTextChannel) {
-      activeTextChannel.send(`📻 Sekarang memutar siaran: **${currentTrack.title}** 🔊`).catch(() => {});
-    }
+    sendPlayerCard(currentTrack, false);
   }
 }
 
-// Otomatis putar lagu berikutnya saat lagu selesai
 player.on(AudioPlayerStatus.Idle, () => {
-  // Jika mode Loop aktif dan tadi memutar file lagu, masukkan kembali ke ujung antrean
   if (isLoopQueue && currentTrack && currentTrack.type === 'file') {
     musicQueue.push(currentTrack);
   }
@@ -162,7 +275,6 @@ player.on('error', error => {
   playNextSong();
 });
 
-// Gabung Voice Channel
 function connectVoice(message, voiceChannel) {
   activeTextChannel = message.channel;
   let connection = getVoiceConnection(message.guild.id);
@@ -187,44 +299,63 @@ client.once('ready', () => {
 client.on('messageCreate', async message => {
   if (message.author.bot || !message.guild) return;
 
-  // 1. HELP (!help)
+  // 1. SEEK KE POSISI TERTENTU (!seek 01:30)
+  if (message.content.startsWith('!seek')) {
+    const arg = message.content.split(' ')[1];
+    if (!arg) {
+      return message.reply('⚠️ Gunakan format: `!seek <menit:detik>` (contoh: `!seek 01:30` atau `!seek 15:00`).');
+    }
+
+    if (!currentTrack || currentTrack.type !== 'file') {
+      return message.reply('⚠️ Tidak ada lagu dari folder yang sedang diputar (siaran radio live tidak bisa di-seek).');
+    }
+
+    const targetSeconds = parseTimeToSeconds(arg);
+    if (targetSeconds === null || targetSeconds < 0) {
+      return message.reply('⚠️ Format waktu tidak valid! Contoh yang benar: `!seek 02:45` atau `!seek 90`.');
+    }
+
+    executeSeek(targetSeconds);
+    return message.reply(`⏩ Melompat ke menit **${formatTime(targetSeconds)}**! 🔊`);
+  }
+
+  // 2. FORWARD (!forward 30)
+  if (message.content.startsWith('!forward')) {
+    const sec = parseInt(message.content.split(' ')[1]) || 15;
+    if (!currentTrack || currentTrack.type !== 'file') return message.reply('⚠️ Hanya file lagu yang bisa di-forward.');
+    const newPos = getCurrentPlaybackSeconds() + sec;
+    executeSeek(newPos);
+    return message.reply(`⏩ Maju **+${sec} detik** (posisi: ${formatTime(newPos)})!`);
+  }
+
+  // 3. REWIND (!rewind 30)
+  if (message.content.startsWith('!rewind')) {
+    const sec = parseInt(message.content.split(' ')[1]) || 15;
+    if (!currentTrack || currentTrack.type !== 'file') return message.reply('⚠️ Hanya file lagu yang bisa di-rewind.');
+    const newPos = Math.max(0, getCurrentPlaybackSeconds() - sec);
+    executeSeek(newPos);
+    return message.reply(`⏪ Mundur **-${sec} detik** (posisi: ${formatTime(newPos)})!`);
+  }
+
+  // 4. HELP (!help)
   if (message.content === '!help') {
-    return message.reply(`🎧 **Daftar Perintah Lengkap Bot:**\n\n` +
+    return message.reply(`🎧 **Daftar Perintah Lengkap:**\n\n` +
+      `⏩ **KONTROL WAKTU (SEEK):**\n` +
+      `• \`!seek <mm:ss>\` : Melompat langsung ke waktu tertentu (contoh: \`!seek 01:30\`)\n` +
+      `• \`!forward <detik>\` : Maju beberapa detik ke depan (contoh: \`!forward 30\`)\n` +
+      `• \`!rewind <detik>\` : Mundur beberapa detik ke belakang (contoh: \`!rewind 15\`)\n\n` +
+      `📁 **PLAYLIST & LAGU:**\n` +
+      `• \`!playlists\` : Lihat semua folder playlist\n` +
+      `• \`!play <nama playlist>\` : Putar seluruh playlist berurutan\n` +
+      `• \`!play <nama lagu>\` : Putar 1 lagu tertentu\n\n` +
       `📻 **RADIO LIVE:**\n` +
       `• \`!radio\` : Lihat daftar channel radio live\n` +
-      `• \`!radio <nama>\` : Putar siaran radio live\n\n` +
-      `📁 **PLAYLIST & LAGU FOLDER:**\n` +
-      `• \`!playlists\` : Lihat semua kategori playlist folder\n` +
-      `• \`!playlist <nama>\` : Lihat lagu di dalam satu playlist\n` +
-      `• \`!play <nama playlist>\` : Putar seluruh lagu di playlist secara berurutan\n` +
-      `• \`!play <nama lagu>\` : Putar 1 lagu tertentu\n\n` +
-      `🎛️ **KONTROL PUTAR (LOOP & SHUFFLE):**\n` +
-      `• \`!loop\` : Mengaktifkan/menonaktifkan mode Ulang (Loop Playlist)\n` +
-      `• \`!shuffle\` : Mengacak urutan lagu di antrean playlist\n` +
-      `• \`!queue\` : Lihat daftar antrean lagu berikutnya\n` +
-      `• \`!skip\` : Lewati lagu yang sedang diputar\n` +
-      `• \`!pause\` / \`!resume\` : Jeda atau lanjutkan audio\n` +
-      `• \`!stop\` : Hentikan audio & bot keluar dari voice\n\n` +
-      `🛡️ **ADMIN:**\n` +
-      `• \`!setup-verify\` : Kirim panel verifikasi member`);
+      `• \`!radio <nama>\` : Putar siaran radio (contoh: \`!radio lofi\`)\n\n` +
+      `🎛️ **KONTROL LAINNYA:**\n` +
+      `• \`!queue\` | \`!skip\` | \`!loop\` | \`!shuffle\` | \`!stop\``);
   }
 
-  // 2. TOGGLE LOOP (!loop)
-  if (message.content === '!loop') {
-    isLoopQueue = !isLoopQueue;
-    return message.reply(`🔂 Mode Loop Playlist sekarang: **${isLoopQueue ? 'AKTIF (Berulang terus menerus)' : 'NONAKTIF (Berhenti jika lagu habis)'}**`);
-  }
-
-  // 3. SHUFFLE ANTREAN (!shuffle)
-  if (message.content === '!shuffle') {
-    if (musicQueue.length <= 1) {
-      return message.reply('⚠️ Butuh minimal 2 lagu di antrean untuk diacak.');
-    }
-    shuffleArray(musicQueue);
-    return message.reply(`🔀 **${musicQueue.length} lagu di antrean berhasil diacak (Shuffle)!** Ketik \`!queue\` untuk melihat urutan baru.`);
-  }
-
-  // 4. PUTAR RADIO (!radio)
+  // 5. PUTAR RADIO (!radio)
   if (message.content.startsWith('!radio')) {
     const args = message.content.split(' ').slice(1);
     const stationKey = args[0] ? args[0].toLowerCase() : null;
@@ -243,7 +374,7 @@ client.on('messageCreate', async message => {
     connectVoice(message, voiceChannel);
 
     musicQueue = [];
-    currentTrack = { title: station.name, url: station.url, type: 'stream' };
+    currentTrack = { title: `Siaran Radio: ${station.name}`, url: station.url, type: 'stream' };
 
     fetchAudioStream(station.url, stream => {
       const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary, inlineVolume: true });
@@ -251,10 +382,11 @@ client.on('messageCreate', async message => {
       player.play(resource);
     });
 
-    return message.reply(`📻 Bergabung ke **${voiceChannel.name}** dan memutar **${station.name}**! 🔊`);
+    sendPlayerCard(currentTrack, false);
+    return;
   }
 
-  // 5. LIHAT PLAYLIST (!playlists)
+  // 6. LIHAT PLAYLIST (!playlists)
   if (message.content === '!playlists') {
     const playlists = getPlaylists();
     if (playlists.length === 0) {
@@ -262,20 +394,6 @@ client.on('messageCreate', async message => {
     }
     const list = playlists.map((p, i) => `${i + 1}. 📁 **${p.name}** — ${p.songs.length} lagu (\`!play ${p.name}\`)`).join('\n');
     return message.reply(`📂 **Daftar Playlist Tersedia:**\n${list}\n\n*Ketik \`!play <nama playlist>\` untuk memutar!*`);
-  }
-
-  // 6. LIHAT LAGU DI SATU PLAYLIST (!playlist <nama>)
-  if (message.content.startsWith('!playlist')) {
-    const playlistName = message.content.split(' ').slice(1).join(' ').trim();
-    if (!playlistName) return message.reply('⚠️ Ketik: `!playlist <nama playlist>` (contoh: `!playlist Pop`).');
-
-    const playlists = getPlaylists();
-    const p = playlists.find(x => x.name.toLowerCase() === playlistName.toLowerCase());
-    if (!p) return message.reply(`❌ Playlist **${playlistName}** tidak ditemukan.`);
-    if (p.songs.length === 0) return message.reply(`📂 Playlist **${p.name}** masih kosong.`);
-
-    const list = p.songs.map((s, i) => `${i + 1}. 🎵 \`${s}\``).join('\n');
-    return message.reply(`📂 **Lagu di Playlist "${p.name}":**\n${list}\n\n*Putar semua lagu dengan: \`!play ${p.name}\`*`);
   }
 
   // 7. PUTAR LAGU / PLAYLIST (!play <nama>)
@@ -288,7 +406,7 @@ client.on('messageCreate', async message => {
 
     connectVoice(message, voiceChannel);
 
-    // Cek apakah nama playlist (folder)
+    // Cek nama playlist (folder)
     const playlists = getPlaylists();
     const matchedPlaylist = playlists.find(p => p.name.toLowerCase() === query.toLowerCase());
 
@@ -304,16 +422,7 @@ client.on('messageCreate', async message => {
         });
       }
 
-      message.reply(`📁 Menambahkan **${matchedPlaylist.songs.length} lagu** dari playlist **${matchedPlaylist.name}** ke antrean! (Loop: ${isLoopQueue ? 'ON' : 'OFF'}) 🎶`);
-      if (wasEmpty) playNextSong();
-      return;
-    }
-
-    // Cek apakah Link URL
-    if (query.startsWith('http://') || query.startsWith('https://')) {
-      const wasEmpty = musicQueue.length === 0 && !currentTrack;
-      musicQueue.push({ title: 'Web Audio Stream', url: query, type: 'stream' });
-      message.reply('🔗 Audio stream ditambahkan ke antrean.');
+      message.reply(`📁 Berhasil memuat **${matchedPlaylist.songs.length} lagu** dari playlist **${matchedPlaylist.name}**! 🎶`);
       if (wasEmpty) playNextSong();
       return;
     }
@@ -327,7 +436,7 @@ client.on('messageCreate', async message => {
       if (wasEmpty) {
         playNextSong();
       } else {
-        message.reply(`➕ Menambahkan **${singleSong.title}** ke antrean (#${musicQueue.length}).`);
+        message.reply(`➕ Menambahkan **${singleSong.title}** ke antrean.`);
       }
       return;
     }
@@ -335,19 +444,11 @@ client.on('messageCreate', async message => {
     return message.reply(`❌ Tidak ditemukan lagu atau playlist **"${query}"**.`);
   }
 
-  // 8. SKIP (!skip)
-  if (message.content === '!skip') {
-    if (!currentTrack) return message.reply('⚠️ Tidak ada lagu yang sedang diputar.');
-    message.reply(`⏭️ Melewati **${currentTrack.title}**...`);
-    player.stop();
-    return;
-  }
-
-  // 9. QUEUE (!queue)
+  // 8. QUEUE (!queue)
   if (message.content === '!queue') {
     if (!currentTrack && musicQueue.length === 0) return message.reply('📭 Antrean musik saat ini kosong.');
 
-    let text = `🎶 **Sedang Diputar:** \`${currentTrack ? currentTrack.title : 'Tidak ada'}\`\n🔂 **Mode Loop:** \`${isLoopQueue ? 'AKTIF' : 'NONAKTIF'}\`\n\n📋 **Antrean Berikutnya:**\n`;
+    let text = `🎶 **Sedang Diputar:** \`${currentTrack ? currentTrack.title : 'Tidak ada'}\`\n\n📋 **Antrean Berikutnya:**\n`;
     if (musicQueue.length === 0) {
       text += '*Tidak ada lagu lagi di antrean.*';
     } else {
@@ -359,27 +460,7 @@ client.on('messageCreate', async message => {
     return message.reply(text);
   }
 
-  // 10. STOP (!stop)
-  if (message.content === '!stop') {
-    musicQueue = [];
-    currentTrack = null;
-    player.stop();
-    const conn = getVoiceConnection(message.guild.id);
-    if (conn) conn.destroy();
-    return message.reply('⏹️ Musik dihentikan, antrean dikosongkan, dan bot keluar dari Voice Channel.');
-  }
-
-  // 11. PAUSE / RESUME
-  if (message.content === '!pause') {
-    player.pause();
-    return message.reply('⏸️ Musik dijeda.');
-  }
-  if (message.content === '!resume') {
-    player.unpause();
-    return message.reply('▶️ Melanjutkan musik.');
-  }
-
-  // 12. VERIFIKASI (Admin)
+  // 9. VERIFIKASI (Admin)
   if (message.content === '!setup-verify') {
     if (!message.member.permissions.has('Administrator')) return message.reply('❌ Khusus Admin.');
     const embed = new EmbedBuilder()
@@ -396,30 +477,116 @@ client.on('messageCreate', async message => {
   }
 });
 
-// INTERAKSI TOMBOL VERIFIKASI
+// --- INTERAKSI TOMBOL CONTROLLER ---
 client.on('interactionCreate', async interaction => {
-  if (!interaction.isButton() || interaction.customId !== 'btn_verify') return;
-  const roleId = process.env.VERIFIED_ROLE_ID;
-  if (!roleId) return interaction.reply({ content: '⚠️ ID Role verifikasi belum diatur.', ephemeral: true });
-  const role = interaction.guild.roles.cache.get(roleId);
-  if (!role) return interaction.reply({ content: '⚠️ Role tidak ditemukan.', ephemeral: true });
-  if (interaction.member.roles.cache.has(roleId)) {
-    return interaction.reply({ content: 'ℹ️ Kamu sudah terverifikasi!', ephemeral: true });
+  if (!interaction.isButton()) return;
+
+  // Verifikasi Member
+  if (interaction.customId === 'btn_verify') {
+    const roleId = process.env.VERIFIED_ROLE_ID;
+    if (!roleId) return interaction.reply({ content: '⚠️ ID Role belum diatur.', ephemeral: true });
+    const role = interaction.guild.roles.cache.get(roleId);
+    if (!role) return interaction.reply({ content: '⚠️ Role tidak ditemukan.', ephemeral: true });
+    if (interaction.member.roles.cache.has(roleId)) {
+      return interaction.reply({ content: 'ℹ️ Kamu sudah terverifikasi!', ephemeral: true });
+    }
+
+    const daysDiff = (Date.now() - interaction.user.createdTimestamp) / (1000 * 60 * 60 * 24);
+    if (daysDiff < 30) {
+      return interaction.reply({ content: `❌ Umur akun baru **${Math.floor(daysDiff)} hari**. Minimal 30 hari.`, ephemeral: true });
+    }
+
+    try {
+      await interaction.member.roles.add(role);
+      return interaction.reply({ content: '🎉 Berhasil diverifikasi!', ephemeral: true });
+    } catch (err) {
+      return interaction.reply({ content: '⚠️ Gagal memberi role.', ephemeral: true });
+    }
   }
 
-  const daysDiff = (Date.now() - interaction.user.createdTimestamp) / (1000 * 60 * 60 * 24);
-  if (daysDiff < 30) {
-    return interaction.reply({
-      content: `❌ Umur akun baru **${Math.floor(daysDiff)} hari**. Minimal 30 hari.`,
-      ephemeral: true
-    });
-  }
+  // Tombol Musik
+  if (interaction.customId.startsWith('btn_player_')) {
+    const voiceChannel = interaction.member.voice.channel;
+    if (!voiceChannel) {
+      return interaction.reply({ content: '⚠️ Kamu harus berada di Voice Channel!', ephemeral: true });
+    }
 
-  try {
-    await interaction.member.roles.add(role);
-    return interaction.reply({ content: '🎉 Berhasil diverifikasi!', ephemeral: true });
-  } catch (error) {
-    return interaction.reply({ content: '⚠️ Gagal memberi role. Cek posisi role bot.', ephemeral: true });
+    // REWIND 10s
+    if (interaction.customId === 'btn_player_rewind10') {
+      if (!currentTrack || currentTrack.type !== 'file') return interaction.reply({ content: '⚠️ Tidak bisa rewind pada siaran radio.', ephemeral: true });
+      const newPos = Math.max(0, getCurrentPlaybackSeconds() - 10);
+      executeSeek(newPos);
+      return interaction.reply({ content: `⏪ Mundur ke **${formatTime(newPos)}**`, ephemeral: true });
+    }
+
+    // FORWARD 10s
+    if (interaction.customId === 'btn_player_forward10') {
+      if (!currentTrack || currentTrack.type !== 'file') return interaction.reply({ content: '⚠️ Tidak bisa forward pada siaran radio.', ephemeral: true });
+      const newPos = getCurrentPlaybackSeconds() + 10;
+      executeSeek(newPos);
+      return interaction.reply({ content: `⏩ Maju ke **${formatTime(newPos)}**`, ephemeral: true });
+    }
+
+    // PLAY / PAUSE
+    if (interaction.customId === 'btn_player_playpause') {
+      if (!currentTrack) return interaction.reply({ content: '⚠️ Tidak ada lagu berputar.', ephemeral: true });
+      if (player.state.status === AudioPlayerStatus.Playing) {
+        player.pause();
+        const embed = buildPlayerEmbed(currentTrack, true);
+        const rows = buildPlayerButtons(true);
+        await interaction.update({ embeds: [embed], components: rows });
+      } else {
+        player.unpause();
+        const embed = buildPlayerEmbed(currentTrack, false);
+        const rows = buildPlayerButtons(false);
+        await interaction.update({ embeds: [embed], components: rows });
+      }
+      return;
+    }
+
+    // SKIP
+    if (interaction.customId === 'btn_player_skip') {
+      if (!currentTrack) return interaction.reply({ content: '⚠️ Tidak ada lagu untuk di-skip.', ephemeral: true });
+      await interaction.reply({ content: `⏭️ **${interaction.user.username}** melewati lagu.`, ephemeral: false });
+      player.stop();
+      return;
+    }
+
+    // SHUFFLE
+    if (interaction.customId === 'btn_player_shuffle') {
+      if (musicQueue.length <= 1) return interaction.reply({ content: '⚠️ Butuh minimal 2 lagu untuk shuffle.', ephemeral: true });
+      shuffleArray(musicQueue);
+      return interaction.reply({ content: '🔀 **Antrean berhasil diacak (Shuffle)!**', ephemeral: true });
+    }
+
+    // LOOP
+    if (interaction.customId === 'btn_player_loop') {
+      isLoopQueue = !isLoopQueue;
+      if (currentTrack) {
+        const embed = buildPlayerEmbed(currentTrack, false);
+        const rows = buildPlayerButtons(false);
+        await interaction.update({ embeds: [embed], components: rows });
+      }
+      return interaction.reply({ content: `🔁 Mode Loop sekarang: **${isLoopQueue ? 'AKTIF' : 'NONAKTIF'}**`, ephemeral: true });
+    }
+
+    // STOP
+    if (interaction.customId === 'btn_player_stop') {
+      musicQueue = [];
+      currentTrack = null;
+      player.stop();
+      const conn = getVoiceConnection(interaction.guild.id);
+      if (conn) conn.destroy();
+
+      const stoppedEmbed = new EmbedBuilder()
+        .setColor('#ED4245')
+        .setTitle('⏹️ Pemutar Musik Dimatikan')
+        .setDescription(`Musik dihentikan oleh **${interaction.user.username}**.`);
+
+      await interaction.update({ embeds: [stoppedEmbed], components: [] });
+      lastPlayerMessage = null;
+      return;
+    }
   }
 });
 

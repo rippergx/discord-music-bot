@@ -29,7 +29,7 @@ const {
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('🎵 Discord Music Player with Seek & Playlist Online 24/7!');
+  res.end('🎵 Discord Music Player with Queue Display Online 24/7!');
 }).listen(PORT, () => {
   console.log(`🚀 Web server running on port ${PORT}`);
 });
@@ -59,14 +59,13 @@ if (!fs.existsSync(MUSIC_DIR)) {
   fs.mkdirSync(MUSIC_DIR, { recursive: true });
 }
 
-// Format Waktu (Detik -> MM:SS)
+// Format Waktu
 function formatTime(seconds) {
   const mins = Math.floor(seconds / 60);
   const secs = Math.floor(seconds % 60);
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
 }
 
-// Parse Waktu (01:30 atau 90 -> Detik)
 function parseTimeToSeconds(timeStr) {
   if (!timeStr) return null;
   const parts = timeStr.split(':').map(Number);
@@ -77,7 +76,6 @@ function parseTimeToSeconds(timeStr) {
   return null;
 }
 
-// Ambil Posisi Waktu Saat Ini
 function getCurrentPlaybackSeconds() {
   if (!currentTrack || !currentTrack.startedAt) return 0;
   const elapsed = (Date.now() - currentTrack.startedAt) / 1000;
@@ -169,9 +167,22 @@ function executeSeek(targetSeconds) {
   return true;
 }
 
-// --- TAMPILAN MODERN MUSIC PLAYER CARD ---
+// --- TAMPILAN MODERN MUSIC PLAYER CARD DENGAN DAFTAR ANTREAN ---
 function buildPlayerEmbed(track, isPaused = false) {
   const currentPos = formatTime(getCurrentPlaybackSeconds());
+
+  // Format Daftar Antrean Lagu Berikutnya (Up Next)
+  let queueListText = '';
+  if (musicQueue.length === 0) {
+    queueListText = '_Tidak ada lagu di antrean._';
+  } else {
+    const previewCount = 4; // Tampilkan 4 judul lagu berikutnya
+    const upcoming = musicQueue.slice(0, previewCount);
+    queueListText = upcoming.map((song, idx) => `**${idx + 1}.** 🎵 \`${song.title}\``).join('\n');
+    if (musicQueue.length > previewCount) {
+      queueListText += `\n*...dan +${musicQueue.length - previewCount} lagu lainnya di antrean.*`;
+    }
+  }
 
   return new EmbedBuilder()
     .setColor('#5865F2')
@@ -184,14 +195,13 @@ function buildPlayerEmbed(track, isPaused = false) {
       `⏱️ Posisi: \`${currentPos}\` ${track.type === 'file' ? '(Gunakan !seek untuk melompat)' : '(Live Stream)'}\n` +
       `🔘▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ 24/7\n\n` +
       `**Status:** ${isPaused ? '⏸️ Dijeda' : '▶️ Sedang Berputar'}\n` +
-      `**Mode Loop:** ${isLoopQueue ? '🔁 Aktif' : '➡️ Sekali Putar'}\n` +
-      `**Sisa Antrean:** \`${musicQueue.length}\` lagu`
+      `**Mode Loop:** ${isLoopQueue ? '🔁 Aktif (Berulang)' : '➡️ Sekali Putar'}\n\n` +
+      `📋 **LAGU BERIKUTNYA (UP NEXT):**\n${queueListText}`
     )
-    .setFooter({ text: 'Gunakan tombol kontrol atau ketik !seek <menit:detik>' });
+    .setFooter({ text: 'Klik tombol di bawah atau ketik !seek <menit:detik>' });
 }
 
 function buildPlayerButtons(isPaused = false) {
-  // Baris 1: Kontrol Navigasi Waktu & Play/Pause
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('btn_player_rewind10').setLabel('-10s').setStyle(ButtonStyle.Secondary).setEmoji('⏪'),
     new ButtonBuilder().setCustomId('btn_player_playpause').setEmoji(isPaused ? '▶️' : '⏸️').setStyle(isPaused ? ButtonStyle.Success : ButtonStyle.Primary),
@@ -200,7 +210,6 @@ function buildPlayerButtons(isPaused = false) {
     new ButtonBuilder().setCustomId('btn_player_stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger)
   );
 
-  // Baris 2: Mode Shuffle & Loop
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('btn_player_shuffle').setEmoji('🔀').setLabel('Shuffle').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('btn_player_loop').setEmoji('🔁').setLabel('Loop').setStyle(isLoopQueue ? ButtonStyle.Primary : ButtonStyle.Secondary)
@@ -299,71 +308,43 @@ client.once('ready', () => {
 client.on('messageCreate', async message => {
   if (message.author.bot || !message.guild) return;
 
-  // 1. SEEK KE POSISI TERTENTU (!seek 01:30)
+  // 1. HELP (!help)
+  if (message.content === '!help') {
+    return message.reply(`🎧 **Panduan Musik Player:**\n\n` +
+      `📁 **PLAYLIST & LAGU:**\n` +
+      `• \`!playlists\` : Lihat semua kategori playlist folder\n` +
+      `• \`!playlist <nama>\` : Lihat lagu di dalam satu playlist\n` +
+      `• \`!play <nama playlist>\` : Putar seluruh lagu di playlist berurutan\n` +
+      `• \`!play <nama lagu>\` : Putar 1 lagu tertentu\n\n` +
+      `⏩ **SEEK & NAVIGASI:**\n` +
+      `• \`!seek <mm:ss>\` : Melompat langsung ke menit tertentu (contoh: \`!seek 01:30\`)\n` +
+      `• \`!forward <detik>\` | \`!rewind <detik>\` : Maju / mundur waktu\n\n` +
+      `📻 **RADIO LIVE:**\n` +
+      `• \`!radio\` : Lihat daftar channel radio live (contoh: \`!radio lofi\`)\n\n` +
+      `🎛️ **KONTROL TOMBOL:**\n` +
+      `Gunakan tombol interaktif di bawah Player Card untuk Play, Pause, Skip, Rewind, Shuffle, dan Loop!`);
+  }
+
+  // 2. SEEK KE POSISI TERTENTU (!seek 01:30)
   if (message.content.startsWith('!seek')) {
     const arg = message.content.split(' ')[1];
-    if (!arg) {
-      return message.reply('⚠️ Gunakan format: `!seek <menit:detik>` (contoh: `!seek 01:30` atau `!seek 15:00`).');
-    }
-
-    if (!currentTrack || currentTrack.type !== 'file') {
-      return message.reply('⚠️ Tidak ada lagu dari folder yang sedang diputar (siaran radio live tidak bisa di-seek).');
-    }
+    if (!arg) return message.reply('⚠️ Format: `!seek <menit:detik>` (contoh: `!seek 01:30`).');
+    if (!currentTrack || currentTrack.type !== 'file') return message.reply('⚠️ Tidak ada lagu dari folder yang sedang diputar.');
 
     const targetSeconds = parseTimeToSeconds(arg);
-    if (targetSeconds === null || targetSeconds < 0) {
-      return message.reply('⚠️ Format waktu tidak valid! Contoh yang benar: `!seek 02:45` atau `!seek 90`.');
-    }
+    if (targetSeconds === null || targetSeconds < 0) return message.reply('⚠️ Format waktu tidak valid! Contoh: `!seek 02:45`.');
 
     executeSeek(targetSeconds);
     return message.reply(`⏩ Melompat ke menit **${formatTime(targetSeconds)}**! 🔊`);
   }
 
-  // 2. FORWARD (!forward 30)
-  if (message.content.startsWith('!forward')) {
-    const sec = parseInt(message.content.split(' ')[1]) || 15;
-    if (!currentTrack || currentTrack.type !== 'file') return message.reply('⚠️ Hanya file lagu yang bisa di-forward.');
-    const newPos = getCurrentPlaybackSeconds() + sec;
-    executeSeek(newPos);
-    return message.reply(`⏩ Maju **+${sec} detik** (posisi: ${formatTime(newPos)})!`);
-  }
-
-  // 3. REWIND (!rewind 30)
-  if (message.content.startsWith('!rewind')) {
-    const sec = parseInt(message.content.split(' ')[1]) || 15;
-    if (!currentTrack || currentTrack.type !== 'file') return message.reply('⚠️ Hanya file lagu yang bisa di-rewind.');
-    const newPos = Math.max(0, getCurrentPlaybackSeconds() - sec);
-    executeSeek(newPos);
-    return message.reply(`⏪ Mundur **-${sec} detik** (posisi: ${formatTime(newPos)})!`);
-  }
-
-  // 4. HELP (!help)
-  if (message.content === '!help') {
-    return message.reply(`🎧 **Daftar Perintah Lengkap:**\n\n` +
-      `⏩ **KONTROL WAKTU (SEEK):**\n` +
-      `• \`!seek <mm:ss>\` : Melompat langsung ke waktu tertentu (contoh: \`!seek 01:30\`)\n` +
-      `• \`!forward <detik>\` : Maju beberapa detik ke depan (contoh: \`!forward 30\`)\n` +
-      `• \`!rewind <detik>\` : Mundur beberapa detik ke belakang (contoh: \`!rewind 15\`)\n\n` +
-      `📁 **PLAYLIST & LAGU:**\n` +
-      `• \`!playlists\` : Lihat semua folder playlist\n` +
-      `• \`!play <nama playlist>\` : Putar seluruh playlist berurutan\n` +
-      `• \`!play <nama lagu>\` : Putar 1 lagu tertentu\n\n` +
-      `📻 **RADIO LIVE:**\n` +
-      `• \`!radio\` : Lihat daftar channel radio live\n` +
-      `• \`!radio <nama>\` : Putar siaran radio (contoh: \`!radio lofi\`)\n\n` +
-      `🎛️ **KONTROL LAINNYA:**\n` +
-      `• \`!queue\` | \`!skip\` | \`!loop\` | \`!shuffle\` | \`!stop\``);
-  }
-
-  // 5. PUTAR RADIO (!radio)
+  // 3. PUTAR RADIO (!radio)
   if (message.content.startsWith('!radio')) {
     const args = message.content.split(' ').slice(1);
     const stationKey = args[0] ? args[0].toLowerCase() : null;
 
     if (!stationKey || !RADIO_STATIONS[stationKey]) {
-      const list = Object.entries(RADIO_STATIONS)
-        .map(([k, v]) => `• \`!radio ${k}\` ➔ **${v.name}**`)
-        .join('\n');
+      const list = Object.entries(RADIO_STATIONS).map(([k, v]) => `• \`!radio ${k}\` ➔ **${v.name}**`).join('\n');
       return message.reply(`📻 **Pilihan Channel Radio Live 24/7:**\n${list}\n\n*Contoh: \`!radio lofi\`*`);
     }
 
@@ -386,17 +367,29 @@ client.on('messageCreate', async message => {
     return;
   }
 
-  // 6. LIHAT PLAYLIST (!playlists)
+  // 4. LIHAT PLAYLIST (!playlists)
   if (message.content === '!playlists') {
     const playlists = getPlaylists();
-    if (playlists.length === 0) {
-      return message.reply('📂 Belum ada folder playlist di `Music`. Buat folder di GitHub (misal: `Music/Pop/`).');
-    }
+    if (playlists.length === 0) return message.reply('📂 Belum ada folder playlist di `Music`.');
     const list = playlists.map((p, i) => `${i + 1}. 📁 **${p.name}** — ${p.songs.length} lagu (\`!play ${p.name}\`)`).join('\n');
     return message.reply(`📂 **Daftar Playlist Tersedia:**\n${list}\n\n*Ketik \`!play <nama playlist>\` untuk memutar!*`);
   }
 
-  // 7. PUTAR LAGU / PLAYLIST (!play <nama>)
+  // 5. LIHAT LAGU DI SATU PLAYLIST (!playlist <nama>)
+  if (message.content.startsWith('!playlist')) {
+    const playlistName = message.content.split(' ').slice(1).join(' ').trim();
+    if (!playlistName) return message.reply('⚠️ Ketik: `!playlist <nama playlist>` (contoh: `!playlist Pop`).');
+
+    const playlists = getPlaylists();
+    const p = playlists.find(x => x.name.toLowerCase() === playlistName.toLowerCase());
+    if (!p) return message.reply(`❌ Playlist **${playlistName}** tidak ditemukan.`);
+    if (p.songs.length === 0) return message.reply(`📂 Playlist **${p.name}** masih kosong.`);
+
+    const list = p.songs.map((s, i) => `${i + 1}. 🎵 \`${s}\``).join('\n');
+    return message.reply(`📂 **Lagu di Playlist "${p.name}":**\n${list}\n\n*Putar semua lagu dengan: \`!play ${p.name}\`*`);
+  }
+
+  // 6. PUTAR LAGU / PLAYLIST (!play <nama>)
   if (message.content.startsWith('!play')) {
     const query = message.content.split(' ').slice(1).join(' ').trim();
     if (!query) return message.reply('⚠️ Gunakan: `!play <nama playlist>` atau `!play <nama lagu>`.');
@@ -423,7 +416,11 @@ client.on('messageCreate', async message => {
       }
 
       message.reply(`📁 Berhasil memuat **${matchedPlaylist.songs.length} lagu** dari playlist **${matchedPlaylist.name}**! 🎶`);
-      if (wasEmpty) playNextSong();
+      if (wasEmpty) {
+        playNextSong();
+      } else if (currentTrack) {
+        sendPlayerCard(currentTrack, false); // Update tampilan antrean langsung
+      }
       return;
     }
 
@@ -437,6 +434,7 @@ client.on('messageCreate', async message => {
         playNextSong();
       } else {
         message.reply(`➕ Menambahkan **${singleSong.title}** ke antrean.`);
+        if (currentTrack) sendPlayerCard(currentTrack, false); // Update tampilan antrean langsung
       }
       return;
     }
@@ -444,23 +442,23 @@ client.on('messageCreate', async message => {
     return message.reply(`❌ Tidak ditemukan lagu atau playlist **"${query}"**.`);
   }
 
-  // 8. QUEUE (!queue)
+  // 7. QUEUE LENGKAP (!queue)
   if (message.content === '!queue') {
     if (!currentTrack && musicQueue.length === 0) return message.reply('📭 Antrean musik saat ini kosong.');
 
-    let text = `🎶 **Sedang Diputar:** \`${currentTrack ? currentTrack.title : 'Tidak ada'}\`\n\n📋 **Antrean Berikutnya:**\n`;
+    let text = `🎶 **Sedang Diputar:** \`${currentTrack ? currentTrack.title : 'Tidak ada'}\`\n\n📋 **Daftar Antrean Lengkap:**\n`;
     if (musicQueue.length === 0) {
       text += '*Tidak ada lagu lagi di antrean.*';
     } else {
-      text += musicQueue.slice(0, 10).map((s, i) => `${i + 1}. \`${s.title}\``).join('\n');
-      if (musicQueue.length > 10) {
-        text += `\n*...dan ${musicQueue.length - 10} lagu lainnya.*`;
+      text += musicQueue.slice(0, 15).map((s, i) => `${i + 1}. \`${s.title}\``).join('\n');
+      if (musicQueue.length > 15) {
+        text += `\n*...dan ${musicQueue.length - 15} lagu lainnya.*`;
       }
     }
     return message.reply(text);
   }
 
-  // 9. VERIFIKASI (Admin)
+  // 8. VERIFIKASI (Admin)
   if (message.content === '!setup-verify') {
     if (!message.member.permissions.has('Administrator')) return message.reply('❌ Khusus Admin.');
     const embed = new EmbedBuilder()
@@ -556,7 +554,12 @@ client.on('interactionCreate', async interaction => {
     if (interaction.customId === 'btn_player_shuffle') {
       if (musicQueue.length <= 1) return interaction.reply({ content: '⚠️ Butuh minimal 2 lagu untuk shuffle.', ephemeral: true });
       shuffleArray(musicQueue);
-      return interaction.reply({ content: '🔀 **Antrean berhasil diacak (Shuffle)!**', ephemeral: true });
+      if (currentTrack) {
+        const embed = buildPlayerEmbed(currentTrack, false);
+        const rows = buildPlayerButtons(false);
+        await interaction.update({ embeds: [embed], components: rows });
+      }
+      return interaction.reply({ content: '🔀 **Antrean berhasil diacak! Urutan lagu diperbarui di Player Card.**', ephemeral: true });
     }
 
     // LOOP

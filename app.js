@@ -14,11 +14,11 @@ const {
 } = require('discord.js');
 const {
   joinVoiceChannel,
+  getVoiceConnection,
   createAudioPlayer,
   createAudioResource,
   AudioPlayerStatus,
   VoiceConnectionStatus,
-  entersState,
   StreamType
 } = require('@discordjs/voice');
 
@@ -116,6 +116,12 @@ client.on('messageCreate', async message => {
 
     const station = RADIO_STATIONS[stationKey];
     try {
+      // Bersihkan koneksi lama jika ada
+      const existingConn = getVoiceConnection(message.guild.id);
+      if (existingConn) {
+        existingConn.destroy();
+      }
+
       const connection = joinVoiceChannel({
         channelId: voiceChannel.id,
         guildId: message.guild.id,
@@ -126,36 +132,36 @@ client.on('messageCreate', async message => {
 
       currentConnection = connection;
 
-      // Debugging suara agar terpantau di Deploy Logs Railway
+      // Pantau perubahan status koneksi
       connection.on('stateChange', (oldState, newState) => {
         console.log(`📡 Voice State: ${oldState.status} -> ${newState.status}`);
-      });
-      connection.on('debug', msg => {
-        console.log(`🔍 Voice Debug: ${msg}`);
+        if (newState.status === VoiceConnectionStatus.Ready) {
+          console.log('🎉 Voice Connection is READY! Suara mulai mengalir.');
+        }
       });
 
-      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+      connection.on('error', err => {
+        console.error('❌ Voice Connection Error:', err);
+      });
 
+      // Langsung hubungkan player dan putar stream
+      connection.subscribe(player);
       const resource = createStreamResource(station.url);
       player.play(resource);
-      connection.subscribe(player);
 
-      return message.reply(`📻 Sedang memutar siaran: **${station.name}** di channel **${voiceChannel.name}**! 🔊`);
+      return message.reply(`📻 Bergabung ke **${voiceChannel.name}** dan memutar siaran **${station.name}**! 🔊`);
     } catch (err) {
       console.error('Error saat koneksi radio:', err);
-      if (currentConnection) {
-        currentConnection.destroy();
-        currentConnection = null;
-      }
-      return message.reply('⚠️ Terjadi error saat menghubungkan audio ke voice channel.');
+      return message.reply('⚠️ Terjadi error saat menghubungkan audio.');
     }
   }
 
   // 2. STOP (!stop)
   if (message.content === '!stop') {
     player.stop();
-    if (currentConnection) {
-      currentConnection.destroy();
+    const conn = getVoiceConnection(message.guild.id);
+    if (conn) {
+      conn.destroy();
       currentConnection = null;
     }
     return message.reply('⏹️ Musik dihentikan dan bot keluar dari Voice Channel.');

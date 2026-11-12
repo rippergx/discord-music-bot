@@ -29,12 +29,57 @@ const {
 const PORT = process.env.PORT || 8080;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('🎵 Discord Multi-Server Music Bot Online 24/7!');
+  res.end('🎵 Discord Multi-Server Music & Absensi Bot Online 24/7!');
 }).listen(PORT, () => {
   console.log(`🚀 Web server running on port ${PORT}`);
 });
 
-// --- 2. DISCORD CLIENT DENGAN INTENTS LENGKAP ---
+// --- 2. DATABASE ABSENSI PERSISTEN (attendance.json) ---
+const ATTENDANCE_FILE = path.join(__dirname, 'attendance.json');
+
+function loadAttendance() {
+  try {
+    if (fs.existsSync(ATTENDANCE_FILE)) {
+      return JSON.parse(fs.readFileSync(ATTENDANCE_FILE, 'utf8'));
+    }
+  } catch (err) {
+    console.error('Error saat membaca attendance.json:', err.message);
+  }
+  return {};
+}
+
+function saveAttendance(data) {
+  try {
+    fs.writeFileSync(ATTENDANCE_FILE, JSON.stringify(data, null, 2), 'utf8');
+  } catch (err) {
+    console.error('Error saat menyimpan attendance.json:', err.message);
+  }
+}
+
+// Format Waktu Indonesia Barat (WIB / GMT+7)
+function getWIBTime(dateObj = new Date()) {
+  const dateKey = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(dateObj); // YYYY-MM-DD
+  const dateFormatted = new Intl.DateTimeFormat('id-ID', {
+    timeZone: 'Asia/Jakarta',
+    weekday: 'long',
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric'
+  }).format(dateObj); // Contoh: Jumat, 13 November 2026
+
+  const rawTime = new Intl.DateTimeFormat('id-ID', {
+    timeZone: 'Asia/Jakarta',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  }).format(dateObj);
+  const timeFormatted = rawTime.replace(/\./g, ':') + ' WIB'; // Contoh: 06:20:21 WIB
+
+  return { dateKey, dateFormatted, timeFormatted };
+}
+
+// --- 3. DISCORD CLIENT ---
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -45,7 +90,7 @@ const client = new Client({
   ]
 });
 
-// --- 3. SISTEM MULTI-SERVER (SETIAP SERVER PUNYA PLAYER SENDIRI) ---
+// --- 4. SISTEM MULTI-SERVER MUSIC PLAYER ---
 const guildManagers = new Map();
 
 function getGuildManager(guildId) {
@@ -140,7 +185,6 @@ function shuffleArray(array) {
   }
 }
 
-// Daftar Channel Radio Live 24/7
 const RADIO_STATIONS = {
   lofi: { name: 'Lofi Chill Beats 24/7', url: 'https://streams.ilovemusic.de/iloveradio17.mp3' },
   prambors: { name: 'Prambors FM', url: 'https://stream.zeno.fm/fvrx452618uvv' },
@@ -312,7 +356,7 @@ function connectVoice(message, voiceChannel) {
   return connection;
 }
 
-// --- 4. EVENT LISTENERS DISCORD ---
+// --- 5. EVENT LISTENERS DISCORD ---
 client.once('ready', () => {
   console.log(`✅ [LOGIN SUKSES] Logged in as ${client.user.tag}!`);
   console.log(`📡 Multi-Server aktif di ${client.guilds.cache.size} server.`);
@@ -321,35 +365,173 @@ client.once('ready', () => {
 client.on('error', err => console.error('❌ Discord Client Error:', err));
 client.on('warn', warn => console.warn('⚠️ Discord Client Warning:', warn));
 
-// --- 5. COMMAND HANDLER ---
+// --- 6. COMMAND HANDLER ---
 client.on('messageCreate', async message => {
   if (message.author.bot || !message.guild) return;
   const guildId = message.guild.id;
   const mgr = getGuildManager(guildId);
 
-  // TES RESPON CEPAT (!ping)
-  if (message.content === '!ping') {
-    return message.reply('🏓 **Pong!** Bot aktif dan siap memutar musik! 🎶');
+  // ==========================================
+  // FITUR ABSENSI MEMBER (!absen & !logabsen)
+  // ==========================================
+
+  // 1. COMMAND: !absen (Hapus chat pengirim seketika)
+  if (message.content === '!absen') {
+    await message.delete().catch(() => {});
+
+    const { dateKey, dateFormatted, timeFormatted } = getWIBTime();
+    const allData = loadAttendance();
+
+    if (!allData[guildId]) allData[guildId] = {};
+    if (!allData[guildId][dateKey]) allData[guildId][dateKey] = [];
+
+    const todayList = allData[guildId][dateKey];
+
+    const existing = todayList.find(item => item.userId === message.author.id);
+    if (existing) {
+      const alreadyEmbed = new EmbedBuilder()
+        .setColor('#FEE75C')
+        .setTitle('⚠️ Kamu Sudah Absen Hari Ini!')
+        .setDescription(
+          `Halo **${message.member?.displayName || message.author.username}**, kamu sudah tercatat hadir pada:\n` +
+          `📅 **Tanggal:** ${existing.dateStr}\n` +
+          `⏰ **Waktu:** ${existing.timeStr}`
+        )
+        .setFooter({ text: 'Absensi hanya bisa dilakukan 1x per hari.' });
+      return message.channel.send({ embeds: [alreadyEmbed] });
+    }
+
+    const displayName = message.member?.displayName || message.author.username;
+    const newEntry = {
+      userId: message.author.id,
+      displayName: displayName,
+      username: message.author.username,
+      dateStr: dateFormatted,
+      timeStr: timeFormatted,
+      timestamp: Date.now()
+    };
+
+    todayList.push(newEntry);
+    saveAttendance(allData);
+
+    const successEmbed = new EmbedBuilder()
+      .setColor('#57F287')
+      .setTitle('✅ Absensi Berhasil Tercatat!')
+      .setThumbnail(message.author.displayAvatarURL({ dynamic: true }))
+      .addFields(
+        { name: '👤 Nama Discord', value: `**${displayName}** (\`@${message.author.username}\`)`, inline: false },
+        { name: '📅 Tanggal', value: dateFormatted, inline: true },
+        { name: '⏰ Waktu Absen', value: timeFormatted, inline: true }
+      )
+      .setFooter({ text: `Urutan kehadiran hari ini: #${todayList.length}` })
+      .setTimestamp();
+
+    return message.channel.send({ embeds: [successEmbed] });
   }
 
-  // 1. HELP (!help)
+  // 2. COMMAND: !logabsen (Hapus chat pengirim seketika)
+  if (message.content.startsWith('!logabsen')) {
+    await message.delete().catch(() => {});
+
+    const args = message.content.split(' ').slice(1).join(' ').trim().toLowerCase();
+    const allData = loadAttendance();
+    const serverData = allData[guildId] || {};
+
+    const { dateKey: todayKey, dateFormatted: todayFormatted } = getWIBTime();
+
+    if (args === 'riwayat' || args === 'history' || args === 'list') {
+      const dates = Object.keys(serverData).sort().reverse();
+      if (dates.length === 0) {
+        return message.channel.send('📂 Belum ada catatan absensi sama sekali di server ini.');
+      }
+      const dateListText = dates.slice(0, 10).map(d => `• \`!logabsen ${d}\` (${serverData[d].length} orang hadir)`).join('\n');
+      return message.channel.send(`📅 **Riwayat Tanggal Absensi Tersedia:**\n${dateListText}\n\n*Ketik perintah di atas untuk melihat siapa saja yang hadir pada tanggal tersebut!*`);
+    }
+
+    let targetDateKey = todayKey;
+    let targetLabel = todayFormatted;
+
+    if (!args || args === 'hari ini' || args === 'today') {
+      targetDateKey = todayKey;
+      targetLabel = todayFormatted;
+    } else if (args === 'kemarin' || args === 'yesterday') {
+      const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      const yInfo = getWIBTime(yesterday);
+      targetDateKey = yInfo.dateKey;
+      targetLabel = yInfo.dateFormatted;
+    } else {
+      let parsed = args.replace(/\//g, '-');
+      const parts = parsed.split('-');
+      if (parts.length === 3) {
+        if (parts[0].length === 4) {
+          targetDateKey = `${parts[0]}-${parts[1].padStart(2, '0')}-${parts[2].padStart(2, '0')}`;
+        } else if (parts[2].length === 4) {
+          targetDateKey = `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+        }
+      } else {
+        targetDateKey = args;
+      }
+      targetLabel = `Tanggal ${targetDateKey}`;
+    }
+
+    const targetList = serverData[targetDateKey] || [];
+
+    if (targetList.length === 0) {
+      const emptyEmbed = new EmbedBuilder()
+        .setColor('#5865F2')
+        .setTitle(`📋 DAFTAR HADIR`)
+        .setDescription(
+          `📅 **${targetLabel}**\n\n` +
+          `_Tidak ada data absensi yang tercatat pada tanggal ini._\n\n` +
+          `💡 *Tips: Ketik \`!logabsen\` untuk hari ini, atau \`!logabsen riwayat\` untuk melihat tanggal yang tersimpan.*`
+        );
+      return message.channel.send({ embeds: [emptyEmbed] });
+    }
+
+    const listText = targetList
+      .map((item, idx) => `**${idx + 1}.** 👤 **${item.displayName}** (\`@${item.username}\`) • ⏰ \`${item.timeStr}\``)
+      .join('\n');
+
+    const logEmbed = new EmbedBuilder()
+      .setColor('#5865F2')
+      .setTitle(`📋 DAFTAR HADIR`)
+      .setDescription(`📅 **${targetList[0]?.dateStr || targetLabel}**\n\n${listText}`)
+      .setFooter({ text: `Total Hadir: ${targetList.length} orang` })
+      .setTimestamp();
+
+    return message.channel.send({ embeds: [logEmbed] });
+  }
+
+  // ==========================================
+  // FITUR TEST KONEKSI & MUSIK PLAYER
+  // ==========================================
+
+  // 3. PING TEST
+  if (message.content === '!ping') {
+    return message.reply('🏓 **Pong!** Bot aktif dan siap melayani server ini!');
+  }
+
+  // 4. HELP (!help)
   if (message.content === '!help') {
-    return message.reply(`🎧 **Panduan Musik Player (Multi-Server):**\n\n` +
-      `📻 **RADIO LIVE (LANGSUNG PUTAR TANPA UPLOAD):**\n` +
+    return message.reply(`🎧 **Panduan Perintah Bot:**\n\n` +
+      `📋 **SISTEM ABSENSI:**\n` +
+      `• \`!absen\` : Absen kehadiran hari ini (pesan perintah otomatis dihapus)\n` +
+      `• \`!logabsen\` : Lihat daftar hadir hari ini\n` +
+      `• \`!logabsen kemarin\` : Lihat daftar hadir kemarin\n` +
+      `• \`!logabsen riwayat\` : Lihat daftar semua tanggal yang pernah ada absensi\n\n` +
+      `📻 **RADIO LIVE 24/7:**\n` +
       `• \`!radio\` : Lihat daftar channel radio\n` +
       `• \`!radio lofi\` : Putar Lofi Beats 24/7\n` +
       `• \`!radio prambors\` | \`!radio genfm\`\n\n` +
-      `📁 **PLAYLIST & LAGU DARI FOLDER:**\n` +
+      `📁 **PLAYLIST & MUSIK DARI FOLDER:**\n` +
       `• \`!playlists\` : Lihat semua kategori playlist folder\n` +
-      `• \`!play <nama playlist>\` : Putar seluruh lagu di playlist\n` +
+      `• \`!play <nama playlist>\` : Putar lagu playlist\n` +
       `• \`!play <nama lagu>\` : Putar 1 lagu tertentu\n\n` +
       `⏩ **KONTROL WAKTU:**\n` +
-      `• \`!seek 01:30\` : Lompat ke menit 01:30\n\n` +
-      `🎛️ **KONTROL TOMBOL:**\n` +
-      `Gunakan tombol interaktif di bawah Player Card untuk Play, Pause, Skip, Rewind, Shuffle, dan Loop!`);
+      `• \`!seek 01:30\` : Lompat ke menit tertentu`);
   }
 
-  // 2. SEEK (!seek 01:30)
+  // 5. SEEK
   if (message.content.startsWith('!seek')) {
     const arg = message.content.split(' ')[1];
     if (!arg) return message.reply('⚠️ Format: `!seek <menit:detik>` (contoh: `!seek 01:30`).');
@@ -362,7 +544,7 @@ client.on('messageCreate', async message => {
     return message.reply(`⏩ Melompat ke menit **${formatTime(targetSeconds)}**! 🔊`);
   }
 
-  // 3. PUTAR RADIO (!radio)
+  // 6. RADIO LIVE
   if (message.content.startsWith('!radio')) {
     const args = message.content.split(' ').slice(1);
     const stationKey = args[0] ? args[0].toLowerCase() : null;
@@ -391,7 +573,7 @@ client.on('messageCreate', async message => {
     return;
   }
 
-  // 4. LIHAT PLAYLIST (!playlists)
+  // 7. PLAYLISTS
   if (message.content === '!playlists') {
     const playlists = getPlaylists();
     if (playlists.length === 0) return message.reply('📂 Belum ada folder playlist di `Music`. Ketik `!radio lofi` untuk mendengarkan radio live!');
@@ -399,7 +581,7 @@ client.on('messageCreate', async message => {
     return message.reply(`📂 **Daftar Playlist Tersedia:**\n${list}\n\n*Ketik \`!play <nama playlist>\` untuk memutar!*`);
   }
 
-  // 5. PUTAR LAGU / PLAYLIST (!play <nama>)
+  // 8. PLAY
   if (message.content.startsWith('!play')) {
     const query = message.content.split(' ').slice(1).join(' ').trim();
     if (!query) {
@@ -409,7 +591,6 @@ client.on('messageCreate', async message => {
     const voiceChannel = message.member?.voice?.channel;
     if (!voiceChannel) return message.reply('⚠️ Kamu harus masuk ke Voice Channel terlebih dahulu!');
 
-    // Cek Playlist (Folder)
     const playlists = getPlaylists();
     const matchedPlaylist = playlists.find(p => p.name.toLowerCase() === query.toLowerCase());
 
@@ -435,7 +616,6 @@ client.on('messageCreate', async message => {
       return;
     }
 
-    // Cek Lagu Tunggal
     const singleSong = findSingleSong(query);
     if (singleSong) {
       connectVoice(message, voiceChannel);
@@ -451,10 +631,10 @@ client.on('messageCreate', async message => {
       return;
     }
 
-    return message.reply(`❌ Tidak ditemukan file musik atau playlist **"${query}"** di folder Music.\n💡 *Tips: Untuk memutar musik streaming tanpa upload lagu, ketik: \`!radio lofi\`*`);
+    return message.reply(`❌ Tidak ditemukan lagu atau playlist **"${query}"** di folder Music.\n💡 *Tips: Untuk mendengarkan musik live streaming tanpa upload lagu, ketik: \`!radio lofi\`*`);
   }
 
-  // 6. QUEUE (!queue)
+  // 9. QUEUE
   if (message.content === '!queue') {
     if (!mgr.currentTrack && mgr.musicQueue.length === 0) return message.reply('📭 Antrean musik saat ini kosong.');
 
@@ -470,7 +650,7 @@ client.on('messageCreate', async message => {
     return message.reply(text);
   }
 
-  // 7. SETUP VERIFIKASI (Admin)
+  // 10. SETUP VERIFIKASI (Admin)
   if (message.content === '!setup-verify') {
     if (!message.member?.permissions.has('Administrator')) return message.reply('❌ Khusus Admin.');
     const embed = new EmbedBuilder()
@@ -487,7 +667,7 @@ client.on('messageCreate', async message => {
   }
 });
 
-// --- 6. INTERAKSI TOMBOL (CONTROLLER & VERIFY) ---
+// --- 7. INTERAKSI TOMBOL ---
 client.on('interactionCreate', async interaction => {
   if (!interaction.isButton()) return;
   const guildId = interaction.guild?.id;
@@ -524,7 +704,6 @@ client.on('interactionCreate', async interaction => {
       return interaction.reply({ content: '⚠️ Kamu harus berada di Voice Channel!', ephemeral: true });
     }
 
-    // REWIND 10s
     if (interaction.customId === 'btn_player_rewind10') {
       if (!mgr.currentTrack || mgr.currentTrack.type !== 'file') return interaction.reply({ content: '⚠️ Tidak bisa rewind pada siaran radio.', ephemeral: true });
       const newPos = Math.max(0, getCurrentPlaybackSeconds(mgr) - 10);
@@ -532,7 +711,6 @@ client.on('interactionCreate', async interaction => {
       return interaction.reply({ content: `⏪ Mundur ke **${formatTime(newPos)}**`, ephemeral: true });
     }
 
-    // FORWARD 10s
     if (interaction.customId === 'btn_player_forward10') {
       if (!mgr.currentTrack || mgr.currentTrack.type !== 'file') return interaction.reply({ content: '⚠️ Tidak bisa forward pada siaran radio.', ephemeral: true });
       const newPos = getCurrentPlaybackSeconds(mgr) + 10;
@@ -540,7 +718,6 @@ client.on('interactionCreate', async interaction => {
       return interaction.reply({ content: `⏩ Maju ke **${formatTime(newPos)}**`, ephemeral: true });
     }
 
-    // PLAY / PAUSE
     if (interaction.customId === 'btn_player_playpause') {
       if (!mgr.currentTrack) return interaction.reply({ content: '⚠️ Tidak ada lagu berputar.', ephemeral: true });
       if (mgr.player.state.status === AudioPlayerStatus.Playing) {
@@ -557,7 +734,6 @@ client.on('interactionCreate', async interaction => {
       return;
     }
 
-    // SKIP
     if (interaction.customId === 'btn_player_skip') {
       if (!mgr.currentTrack) return interaction.reply({ content: '⚠️ Tidak ada lagu untuk di-skip.', ephemeral: true });
       await interaction.reply({ content: `⏭️ **${interaction.user.username}** melewati lagu.`, ephemeral: false });
@@ -565,7 +741,6 @@ client.on('interactionCreate', async interaction => {
       return;
     }
 
-    // SHUFFLE
     if (interaction.customId === 'btn_player_shuffle') {
       if (mgr.musicQueue.length <= 1) return interaction.reply({ content: '⚠️ Butuh minimal 2 lagu untuk shuffle.', ephemeral: true });
       shuffleArray(mgr.musicQueue);
@@ -577,7 +752,6 @@ client.on('interactionCreate', async interaction => {
       return interaction.reply({ content: '🔀 **Antrean di server ini berhasil diacak!**', ephemeral: true });
     }
 
-    // LOOP
     if (interaction.customId === 'btn_player_loop') {
       mgr.isLoopQueue = !mgr.isLoopQueue;
       if (mgr.currentTrack) {
@@ -588,7 +762,6 @@ client.on('interactionCreate', async interaction => {
       return interaction.reply({ content: `🔁 Mode Loop di server ini: **${mgr.isLoopQueue ? 'AKTIF' : 'NONAKTIF'}**`, ephemeral: true });
     }
 
-    // STOP
     if (interaction.customId === 'btn_player_stop') {
       mgr.musicQueue = [];
       mgr.currentTrack = null;
@@ -609,7 +782,7 @@ client.on('interactionCreate', async interaction => {
   }
 });
 
-// --- 7. LOGIN DISCORD DENGAN LOG JELAS ---
+// --- 8. LOGIN BOT ---
 console.log('🤖 Menghubungkan bot ke Discord...');
 client.login(process.env.DISCORD_TOKEN).catch(err => {
   console.error('❌ GAGAL LOGIN KE DISCORD! Periksa DISCORD_TOKEN atau Privileged Intents:', err.message);

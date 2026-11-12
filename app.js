@@ -28,7 +28,7 @@ const {
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('🎵 Discord Music, Playlist & Radio Bot Online 24/7 on Railway!');
+  res.end('🎵 Discord Music Bot Online 24/7 on Railway!');
 }).listen(PORT, () => {
   console.log(`🚀 Web server running on port ${PORT}`);
 });
@@ -50,6 +50,9 @@ let musicQueue = [];
 let currentTrack = null;
 let activeTextChannel = null;
 
+// Pengaturan Loop & Shuffle
+let isLoopQueue = true; // Default ON agar playlist memutar ulang terus menerus
+
 // Direktori Musik
 const MUSIC_DIR = path.join(__dirname, 'Music');
 if (!fs.existsSync(MUSIC_DIR)) {
@@ -67,16 +70,13 @@ function getPlaylists() {
   });
 }
 
-// 2. Cari Lagu Tertentu di Semua Folder
+// 2. Cari Lagu Tertentu
 function findSingleSong(query) {
   const q = query.toLowerCase();
-  
-  // Cek file di root Music/
   const rootFiles = fs.readdirSync(MUSIC_DIR).filter(f => f.endsWith('.mp3') || f.endsWith('.wav') || f.endsWith('.ogg'));
   let match = rootFiles.find(f => f.toLowerCase() === q || f.toLowerCase() === `${q}.mp3` || f.toLowerCase().includes(q));
   if (match) return { title: match, path: path.join(MUSIC_DIR, match) };
 
-  // Cek di subfolder playlist
   const playlists = getPlaylists();
   for (const p of playlists) {
     let pMatch = p.songs.find(f => f.toLowerCase() === q || f.toLowerCase() === `${q}.mp3` || f.toLowerCase().includes(q));
@@ -87,7 +87,15 @@ function findSingleSong(query) {
   return null;
 }
 
-// 3. Daftar Channel Radio 24/7 Siap Putar
+// 3. Fungsi Acak Lagu (Shuffle)
+function shuffleArray(array) {
+  for (let i = array.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [array[i], array[j]] = [array[j], array[i]];
+  }
+}
+
+// 4. Daftar Radio Live 24/7
 const RADIO_STATIONS = {
   lofi: { name: 'Lofi Chill Beats 24/7', url: 'https://streams.ilovemusic.de/iloveradio17.mp3' },
   prambors: { name: 'Prambors FM', url: 'https://stream.zeno.fm/fvrx452618uvv' },
@@ -142,7 +150,10 @@ function playNextSong() {
 
 // Otomatis putar lagu berikutnya saat lagu selesai
 player.on(AudioPlayerStatus.Idle, () => {
-  console.log('⏹️ Lagu selesai, lanjut antrean berikutnya...');
+  // Jika mode Loop aktif dan tadi memutar file lagu, masukkan kembali ke ujung antrean
+  if (isLoopQueue && currentTrack && currentTrack.type === 'file') {
+    musicQueue.push(currentTrack);
+  }
   playNextSong();
 });
 
@@ -176,19 +187,21 @@ client.once('ready', () => {
 client.on('messageCreate', async message => {
   if (message.author.bot || !message.guild) return;
 
-  // 1. DAFTAR PERINTAH LENGKAP (!help)
+  // 1. HELP (!help)
   if (message.content === '!help') {
-    return message.reply(`🎧 **Daftar Perintah Bot:**\n\n` +
+    return message.reply(`🎧 **Daftar Perintah Lengkap Bot:**\n\n` +
       `📻 **RADIO LIVE:**\n` +
       `• \`!radio\` : Lihat daftar channel radio live\n` +
-      `• \`!radio <nama>\` : Putar siaran radio (contoh: \`!radio lofi\`, \`!radio prambors\`)\n\n` +
+      `• \`!radio <nama>\` : Putar siaran radio live\n\n` +
       `📁 **PLAYLIST & LAGU FOLDER:**\n` +
       `• \`!playlists\` : Lihat semua kategori playlist folder\n` +
       `• \`!playlist <nama>\` : Lihat lagu di dalam satu playlist\n` +
       `• \`!play <nama playlist>\` : Putar seluruh lagu di playlist secara berurutan\n` +
       `• \`!play <nama lagu>\` : Putar 1 lagu tertentu\n\n` +
-      `🎛️ **KONTROL SUARA:**\n` +
-      `• \`!queue\` : Lihat antrean lagu berikutnya\n` +
+      `🎛️ **KONTROL PUTAR (LOOP & SHUFFLE):**\n` +
+      `• \`!loop\` : Mengaktifkan/menonaktifkan mode Ulang (Loop Playlist)\n` +
+      `• \`!shuffle\` : Mengacak urutan lagu di antrean playlist\n` +
+      `• \`!queue\` : Lihat daftar antrean lagu berikutnya\n` +
       `• \`!skip\` : Lewati lagu yang sedang diputar\n` +
       `• \`!pause\` / \`!resume\` : Jeda atau lanjutkan audio\n` +
       `• \`!stop\` : Hentikan audio & bot keluar dari voice\n\n` +
@@ -196,7 +209,22 @@ client.on('messageCreate', async message => {
       `• \`!setup-verify\` : Kirim panel verifikasi member`);
   }
 
-  // 2. PUTAR RADIO LIVE (!radio atau !radio lofi)
+  // 2. TOGGLE LOOP (!loop)
+  if (message.content === '!loop') {
+    isLoopQueue = !isLoopQueue;
+    return message.reply(`🔂 Mode Loop Playlist sekarang: **${isLoopQueue ? 'AKTIF (Berulang terus menerus)' : 'NONAKTIF (Berhenti jika lagu habis)'}**`);
+  }
+
+  // 3. SHUFFLE ANTREAN (!shuffle)
+  if (message.content === '!shuffle') {
+    if (musicQueue.length <= 1) {
+      return message.reply('⚠️ Butuh minimal 2 lagu di antrean untuk diacak.');
+    }
+    shuffleArray(musicQueue);
+    return message.reply(`🔀 **${musicQueue.length} lagu di antrean berhasil diacak (Shuffle)!** Ketik \`!queue\` untuk melihat urutan baru.`);
+  }
+
+  // 4. PUTAR RADIO (!radio)
   if (message.content.startsWith('!radio')) {
     const args = message.content.split(' ').slice(1);
     const stationKey = args[0] ? args[0].toLowerCase() : null;
@@ -205,26 +233,20 @@ client.on('messageCreate', async message => {
       const list = Object.entries(RADIO_STATIONS)
         .map(([k, v]) => `• \`!radio ${k}\` ➔ **${v.name}**`)
         .join('\n');
-      return message.reply(`📻 **Pilihan Channel Radio Live 24/7:**\n${list}\n\n*Contoh: Ketik \`!radio lofi\` atau \`!radio prambors\` saat di voice channel.*`);
+      return message.reply(`📻 **Pilihan Channel Radio Live 24/7:**\n${list}\n\n*Contoh: \`!radio lofi\`*`);
     }
 
     const voiceChannel = message.member.voice.channel;
-    if (!voiceChannel) {
-      return message.reply('⚠️ Kamu harus masuk ke salah satu Voice Channel terlebih dahulu!');
-    }
+    if (!voiceChannel) return message.reply('⚠️ Kamu harus masuk ke Voice Channel terlebih dahulu!');
 
     const station = RADIO_STATIONS[stationKey];
     connectVoice(message, voiceChannel);
 
-    // Kosongkan antrean karena beralih ke radio live
     musicQueue = [];
     currentTrack = { title: station.name, url: station.url, type: 'stream' };
 
     fetchAudioStream(station.url, stream => {
-      const resource = createAudioResource(stream, {
-        inputType: StreamType.Arbitrary,
-        inlineVolume: true
-      });
+      const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary, inlineVolume: true });
       if (resource.volume) resource.volume.setVolume(0.8);
       player.play(resource);
     });
@@ -232,45 +254,37 @@ client.on('messageCreate', async message => {
     return message.reply(`📻 Bergabung ke **${voiceChannel.name}** dan memutar **${station.name}**! 🔊`);
   }
 
-  // 3. LIHAT DAFTAR PLAYLIST (!playlists)
+  // 5. LIHAT PLAYLIST (!playlists)
   if (message.content === '!playlists') {
     const playlists = getPlaylists();
     if (playlists.length === 0) {
-      return message.reply('📂 Belum ada folder playlist di folder `Music`. Upload folder di GitHub (misal: `Music/Pop/`).');
+      return message.reply('📂 Belum ada folder playlist di `Music`. Buat folder di GitHub (misal: `Music/Pop/`).');
     }
     const list = playlists.map((p, i) => `${i + 1}. 📁 **${p.name}** — ${p.songs.length} lagu (\`!play ${p.name}\`)`).join('\n');
-    return message.reply(`📂 **Daftar Playlist Tersedia:**\n${list}\n\n*Ketik \`!play <nama playlist>\` untuk memutar seluruh playlist!*`);
+    return message.reply(`📂 **Daftar Playlist Tersedia:**\n${list}\n\n*Ketik \`!play <nama playlist>\` untuk memutar!*`);
   }
 
-  // 4. LIHAT LAGU DI SATU PLAYLIST (!playlist <nama>)
+  // 6. LIHAT LAGU DI SATU PLAYLIST (!playlist <nama>)
   if (message.content.startsWith('!playlist')) {
     const playlistName = message.content.split(' ').slice(1).join(' ').trim();
-    if (!playlistName) {
-      return message.reply('⚠️ Ketik: `!playlist <nama playlist>` (contoh: `!playlist Pop`).');
-    }
+    if (!playlistName) return message.reply('⚠️ Ketik: `!playlist <nama playlist>` (contoh: `!playlist Pop`).');
+
     const playlists = getPlaylists();
     const p = playlists.find(x => x.name.toLowerCase() === playlistName.toLowerCase());
-    if (!p) {
-      return message.reply(`❌ Playlist **${playlistName}** tidak ditemukan. Ketik \`!playlists\` untuk melihat daftar.`);
-    }
-    if (p.songs.length === 0) {
-      return message.reply(`📂 Playlist **${p.name}** masih kosong.`);
-    }
+    if (!p) return message.reply(`❌ Playlist **${playlistName}** tidak ditemukan.`);
+    if (p.songs.length === 0) return message.reply(`📂 Playlist **${p.name}** masih kosong.`);
+
     const list = p.songs.map((s, i) => `${i + 1}. 🎵 \`${s}\``).join('\n');
-    return message.reply(`📂 **Lagu di Playlist "${p.name}":**\n${list}\n\n*Putar dengan: \`!play ${p.name}\`*`);
+    return message.reply(`📂 **Lagu di Playlist "${p.name}":**\n${list}\n\n*Putar semua lagu dengan: \`!play ${p.name}\`*`);
   }
 
-  // 5. PUTAR PLAYLIST ATAU LAGU (!play <nama>)
+  // 7. PUTAR LAGU / PLAYLIST (!play <nama>)
   if (message.content.startsWith('!play')) {
     const query = message.content.split(' ').slice(1).join(' ').trim();
-    if (!query) {
-      return message.reply('⚠️ Gunakan: `!play <nama playlist>` atau `!play <nama lagu>`.\nKetik `!playlists` untuk melihat daftar!');
-    }
+    if (!query) return message.reply('⚠️ Gunakan: `!play <nama playlist>` atau `!play <nama lagu>`.');
 
     const voiceChannel = message.member.voice.channel;
-    if (!voiceChannel) {
-      return message.reply('⚠️ Kamu harus masuk ke salah satu Voice Channel terlebih dahulu!');
-    }
+    if (!voiceChannel) return message.reply('⚠️ Kamu harus masuk ke Voice Channel terlebih dahulu!');
 
     connectVoice(message, voiceChannel);
 
@@ -279,9 +293,7 @@ client.on('messageCreate', async message => {
     const matchedPlaylist = playlists.find(p => p.name.toLowerCase() === query.toLowerCase());
 
     if (matchedPlaylist) {
-      if (matchedPlaylist.songs.length === 0) {
-        return message.reply(`⚠️ Playlist **${matchedPlaylist.name}** kosong.`);
-      }
+      if (matchedPlaylist.songs.length === 0) return message.reply(`⚠️ Playlist **${matchedPlaylist.name}** kosong.`);
 
       const wasEmpty = musicQueue.length === 0 && !currentTrack;
       for (const song of matchedPlaylist.songs) {
@@ -292,7 +304,7 @@ client.on('messageCreate', async message => {
         });
       }
 
-      message.reply(`📁 Menambahkan **${matchedPlaylist.songs.length} lagu** dari playlist **${matchedPlaylist.name}** ke antrean! 🎶`);
+      message.reply(`📁 Menambahkan **${matchedPlaylist.songs.length} lagu** dari playlist **${matchedPlaylist.name}** ke antrean! (Loop: ${isLoopQueue ? 'ON' : 'OFF'}) 🎶`);
       if (wasEmpty) playNextSong();
       return;
     }
@@ -320,25 +332,22 @@ client.on('messageCreate', async message => {
       return;
     }
 
-    return message.reply(`❌ Tidak ditemukan lagu atau playlist dengan nama **"${query}"**.\nKetik \`!playlists\` untuk melihat daftar folder.`);
+    return message.reply(`❌ Tidak ditemukan lagu atau playlist **"${query}"**.`);
   }
 
-  // 6. SKIP LAGU (!skip)
+  // 8. SKIP (!skip)
   if (message.content === '!skip') {
-    if (!currentTrack) {
-      return message.reply('⚠️ Tidak ada lagu yang sedang diputar.');
-    }
+    if (!currentTrack) return message.reply('⚠️ Tidak ada lagu yang sedang diputar.');
     message.reply(`⏭️ Melewati **${currentTrack.title}**...`);
-    player.stop(); // Memicu Idle ➔ otomatis memutar antrean berikutnya
+    player.stop();
     return;
   }
 
-  // 7. LIHAT ANTREAN (!queue)
+  // 9. QUEUE (!queue)
   if (message.content === '!queue') {
-    if (!currentTrack && musicQueue.length === 0) {
-      return message.reply('📭 Antrean musik saat ini kosong.');
-    }
-    let text = `🎶 **Sedang Diputar:** \`${currentTrack ? currentTrack.title : 'Tidak ada'}\`\n\n📋 **Antrean Berikutnya:**\n`;
+    if (!currentTrack && musicQueue.length === 0) return message.reply('📭 Antrean musik saat ini kosong.');
+
+    let text = `🎶 **Sedang Diputar:** \`${currentTrack ? currentTrack.title : 'Tidak ada'}\`\n🔂 **Mode Loop:** \`${isLoopQueue ? 'AKTIF' : 'NONAKTIF'}\`\n\n📋 **Antrean Berikutnya:**\n`;
     if (musicQueue.length === 0) {
       text += '*Tidak ada lagu lagi di antrean.*';
     } else {
@@ -350,7 +359,7 @@ client.on('messageCreate', async message => {
     return message.reply(text);
   }
 
-  // 8. STOP (!stop)
+  // 10. STOP (!stop)
   if (message.content === '!stop') {
     musicQueue = [];
     currentTrack = null;
@@ -360,7 +369,7 @@ client.on('messageCreate', async message => {
     return message.reply('⏹️ Musik dihentikan, antrean dikosongkan, dan bot keluar dari Voice Channel.');
   }
 
-  // 9. PAUSE / RESUME
+  // 11. PAUSE / RESUME
   if (message.content === '!pause') {
     player.pause();
     return message.reply('⏸️ Musik dijeda.');
@@ -370,7 +379,7 @@ client.on('messageCreate', async message => {
     return message.reply('▶️ Melanjutkan musik.');
   }
 
-  // 10. VERIFIKASI (Admin)
+  // 12. VERIFIKASI (Admin)
   if (message.content === '!setup-verify') {
     if (!message.member.permissions.has('Administrator')) return message.reply('❌ Khusus Admin.');
     const embed = new EmbedBuilder()

@@ -25,8 +25,8 @@ const {
   StreamType
 } = require('@discordjs/voice');
 
-// --- WEB SERVER (RAILWAY HEALTHCHECK) ---
-const PORT = process.env.PORT || 3000;
+// --- 1. WEB SERVER UNTUK HEALTHCHECK RAILWAY ---
+const PORT = process.env.PORT || 8080;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
   res.end('🎵 Discord Multi-Server Music Bot Online 24/7!');
@@ -34,7 +34,7 @@ http.createServer((req, res) => {
   console.log(`🚀 Web server running on port ${PORT}`);
 });
 
-// --- DISCORD CLIENT ---
+// --- 2. DISCORD CLIENT DENGAN INTENTS LENGKAP ---
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -45,7 +45,7 @@ const client = new Client({
   ]
 });
 
-// --- SISTEM MULTI-SERVER (SETIAP SERVER MEMILIKI PLAYER & ANTREAN SENDIRI) ---
+// --- 3. SISTEM MULTI-SERVER (SETIAP SERVER PUNYA PLAYER SENDIRI) ---
 const guildManagers = new Map();
 
 function getGuildManager(guildId) {
@@ -61,9 +61,8 @@ function getGuildManager(guildId) {
       lastPlayerMessage: null
     };
 
-    // Otomatis putar lagu berikutnya saat lagu selesai di server ini
     newPlayer.on(AudioPlayerStatus.Idle, () => {
-      console.log(`[Server ${guildId}] Lagu selesai, lanjut lagu berikutnya...`);
+      console.log(`[Server ${guildId}] Lagu selesai, lanjut ke berikutnya...`);
       if (mgr.isLoopQueue && mgr.currentTrack && mgr.currentTrack.type === 'file') {
         mgr.musicQueue.push(mgr.currentTrack);
       }
@@ -86,7 +85,6 @@ if (!fs.existsSync(MUSIC_DIR)) {
   fs.mkdirSync(MUSIC_DIR, { recursive: true });
 }
 
-// Format Waktu
 function formatTime(seconds) {
   const mins = Math.floor(seconds / 60);
   const secs = Math.floor(seconds % 60);
@@ -109,7 +107,6 @@ function getCurrentPlaybackSeconds(mgr) {
   return Math.max(0, (mgr.currentTrack.seekOffset || 0) + elapsed);
 }
 
-// 1. Ambil Semua Playlist Folder
 function getPlaylists() {
   if (!fs.existsSync(MUSIC_DIR)) return [];
   const entries = fs.readdirSync(MUSIC_DIR, { withFileTypes: true });
@@ -120,7 +117,6 @@ function getPlaylists() {
   });
 }
 
-// 2. Cari Lagu Tertentu
 function findSingleSong(query) {
   const q = query.toLowerCase();
   const rootFiles = fs.readdirSync(MUSIC_DIR).filter(f => f.endsWith('.mp3') || f.endsWith('.wav') || f.endsWith('.ogg'));
@@ -137,7 +133,6 @@ function findSingleSong(query) {
   return null;
 }
 
-// 3. Acak Lagu (Shuffle)
 function shuffleArray(array) {
   for (let i = array.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -145,7 +140,7 @@ function shuffleArray(array) {
   }
 }
 
-// 4. Daftar Radio Live 24/7
+// Daftar Channel Radio Live 24/7
 const RADIO_STATIONS = {
   lofi: { name: 'Lofi Chill Beats 24/7', url: 'https://streams.ilovemusic.de/iloveradio17.mp3' },
   prambors: { name: 'Prambors FM', url: 'https://stream.zeno.fm/fvrx452618uvv' },
@@ -153,7 +148,6 @@ const RADIO_STATIONS = {
   hardrock: { name: 'Hard Rock FM', url: 'https://stream.zeno.fm/u2213718v8zuv' }
 };
 
-// Stream Fetcher untuk Radio / URL
 function fetchAudioStream(url, callback) {
   const lib = url.startsWith('https') ? https : http;
   lib.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, res => {
@@ -164,7 +158,6 @@ function fetchAudioStream(url, callback) {
   }).on('error', err => console.error('Stream Error:', err.message));
 }
 
-// FUNGSI SEEK KE DETIK TERTENTU
 function executeSeek(guildId, targetSeconds) {
   const mgr = getGuildManager(guildId);
   if (!mgr || !mgr.currentTrack || mgr.currentTrack.type !== 'file') return false;
@@ -195,7 +188,6 @@ function executeSeek(guildId, targetSeconds) {
   return true;
 }
 
-// --- TAMPILAN CONTROLLER CARD (PER SERVER) ---
 function buildPlayerEmbed(mgr, track, isPaused = false) {
   const currentPos = formatTime(getCurrentPlaybackSeconds(mgr));
 
@@ -207,7 +199,7 @@ function buildPlayerEmbed(mgr, track, isPaused = false) {
     const upcoming = mgr.musicQueue.slice(0, previewCount);
     queueListText = upcoming.map((song, idx) => `**${idx + 1}.** 🎵 \`${song.title}\``).join('\n');
     if (mgr.musicQueue.length > previewCount) {
-      queueListText += `\n*...dan +${mgr.musicQueue.length - previewCount} lagu lainnya di antrean.*`;
+      queueListText += `\n*...dan +${mgr.musicQueue.length - previewCount} lagu lainnya.*`;
     }
   }
 
@@ -215,11 +207,11 @@ function buildPlayerEmbed(mgr, track, isPaused = false) {
     .setColor('#5865F2')
     .setAuthor({
       name: 'MUSIC PLAYER CONTROLLER',
-      iconURL: client.user.displayAvatarURL()
+      iconURL: client.user ? client.user.displayAvatarURL() : undefined
     })
     .setTitle(`🎶 ${track.title}`)
     .setDescription(
-      `⏱️ Posisi: \`${currentPos}\` ${track.type === 'file' ? '(Gunakan !seek untuk melompat)' : '(Live Stream)'}\n` +
+      `⏱️ Posisi: \`${currentPos}\` ${track.type === 'file' ? '(Gunakan !seek untuk lompat)' : '(Live Stream)'}\n` +
       `🔘▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ 24/7\n\n` +
       `**Status:** ${isPaused ? '⏸️ Dijeda' : '▶️ Sedang Berputar'}\n` +
       `**Mode Loop:** ${mgr.isLoopQueue ? '🔁 Aktif (Berulang)' : '➡️ Sekali Putar'}\n\n` +
@@ -257,11 +249,10 @@ async function sendPlayerCard(guildId, track, isPaused = false) {
     }
     mgr.lastPlayerMessage = await mgr.activeTextChannel.send({ embeds: [embed], components: rows });
   } catch (err) {
-    console.error('Error kirim player card:', err);
+    console.error(`[Server ${guildId}] Gagal kirim player card:`, err.message);
   }
 }
 
-// Memutar Lagu Berikutnya di Antrean Server Tertentu
 function playNextSong(guildId) {
   const mgr = getGuildManager(guildId);
   if (mgr.musicQueue.length === 0) {
@@ -295,6 +286,7 @@ function playNextSong(guildId) {
         inputType: StreamType.Arbitrary,
         inlineVolume: true
       });
+      if (resource.volume) resource.volume.setVolume(0.8);
       mgr.player.play(resource);
     });
     sendPlayerCard(guildId, mgr.currentTrack, false);
@@ -306,7 +298,7 @@ function connectVoice(message, voiceChannel) {
   mgr.activeTextChannel = message.channel;
 
   let connection = getVoiceConnection(message.guild.id);
-  if (!connection) {
+  if (!connection || connection.state.status === VoiceConnectionStatus.Destroyed) {
     connection = joinVoiceChannel({
       channelId: voiceChannel.id,
       guildId: message.guild.id,
@@ -314,40 +306,50 @@ function connectVoice(message, voiceChannel) {
       selfDeaf: true,
       selfMute: false
     });
-    connection.subscribe(mgr.player);
   }
+
+  connection.subscribe(mgr.player);
   return connection;
 }
 
+// --- 4. EVENT LISTENERS DISCORD ---
 client.once('ready', () => {
-  console.log(`✅ Logged in as ${client.user.tag}! Multi-Server Ready.`);
+  console.log(`✅ [LOGIN SUKSES] Logged in as ${client.user.tag}!`);
+  console.log(`📡 Multi-Server aktif di ${client.guilds.cache.size} server.`);
 });
 
-// --- COMMAND HANDLER ---
+client.on('error', err => console.error('❌ Discord Client Error:', err));
+client.on('warn', warn => console.warn('⚠️ Discord Client Warning:', warn));
+
+// --- 5. COMMAND HANDLER ---
 client.on('messageCreate', async message => {
   if (message.author.bot || !message.guild) return;
   const guildId = message.guild.id;
   const mgr = getGuildManager(guildId);
 
+  // TES RESPON CEPAT (!ping)
+  if (message.content === '!ping') {
+    return message.reply('🏓 **Pong!** Bot aktif dan siap memutar musik! 🎶');
+  }
+
   // 1. HELP (!help)
   if (message.content === '!help') {
     return message.reply(`🎧 **Panduan Musik Player (Multi-Server):**\n\n` +
-      `📁 **PLAYLIST & LAGU:**\n` +
+      `📻 **RADIO LIVE (LANGSUNG PUTAR TANPA UPLOAD):**\n` +
+      `• \`!radio\` : Lihat daftar channel radio\n` +
+      `• \`!radio lofi\` : Putar Lofi Beats 24/7\n` +
+      `• \`!radio prambors\` | \`!radio genfm\`\n\n` +
+      `📁 **PLAYLIST & LAGU DARI FOLDER:**\n` +
       `• \`!playlists\` : Lihat semua kategori playlist folder\n` +
-      `• \`!playlist <nama>\` : Lihat lagu di dalam satu playlist\n` +
-      `• \`!play <nama playlist>\` : Putar seluruh lagu di playlist berurutan\n` +
+      `• \`!play <nama playlist>\` : Putar seluruh lagu di playlist\n` +
       `• \`!play <nama lagu>\` : Putar 1 lagu tertentu\n\n` +
-      `⏩ **SEEK & NAVIGASI:**\n` +
-      `• \`!seek <mm:ss>\` : Melompat ke menit tertentu (contoh: \`!seek 01:30\`)\n` +
-      `• \`!forward <detik>\` | \`!rewind <detik>\` : Maju / mundur waktu\n\n` +
-      `📻 **RADIO LIVE:**\n` +
-      `• \`!radio\` : Lihat daftar channel radio live\n` +
-      `• \`!radio <nama>\` : Putar radio live (contoh: \`!radio lofi\`)\n\n` +
+      `⏩ **KONTROL WAKTU:**\n` +
+      `• \`!seek 01:30\` : Lompat ke menit 01:30\n\n` +
       `🎛️ **KONTROL TOMBOL:**\n` +
       `Gunakan tombol interaktif di bawah Player Card untuk Play, Pause, Skip, Rewind, Shuffle, dan Loop!`);
   }
 
-  // 2. SEEK KE POSISI TERTENTU (!seek 01:30)
+  // 2. SEEK (!seek 01:30)
   if (message.content.startsWith('!seek')) {
     const arg = message.content.split(' ')[1];
     if (!arg) return message.reply('⚠️ Format: `!seek <menit:detik>` (contoh: `!seek 01:30`).');
@@ -367,10 +369,10 @@ client.on('messageCreate', async message => {
 
     if (!stationKey || !RADIO_STATIONS[stationKey]) {
       const list = Object.entries(RADIO_STATIONS).map(([k, v]) => `• \`!radio ${k}\` ➔ **${v.name}**`).join('\n');
-      return message.reply(`📻 **Pilihan Channel Radio Live 24/7:**\n${list}\n\n*Contoh: \`!radio lofi\`*`);
+      return message.reply(`📻 **Pilihan Channel Radio Live 24/7:**\n${list}\n\n*Contoh: Ketik \`!radio lofi\` saat berada di voice channel!*`);
     }
 
-    const voiceChannel = message.member.voice.channel;
+    const voiceChannel = message.member?.voice?.channel;
     if (!voiceChannel) return message.reply('⚠️ Kamu harus masuk ke Voice Channel terlebih dahulu!');
 
     const station = RADIO_STATIONS[stationKey];
@@ -392,42 +394,29 @@ client.on('messageCreate', async message => {
   // 4. LIHAT PLAYLIST (!playlists)
   if (message.content === '!playlists') {
     const playlists = getPlaylists();
-    if (playlists.length === 0) return message.reply('📂 Belum ada folder playlist di `Music`.');
+    if (playlists.length === 0) return message.reply('📂 Belum ada folder playlist di `Music`. Ketik `!radio lofi` untuk mendengarkan radio live!');
     const list = playlists.map((p, i) => `${i + 1}. 📁 **${p.name}** — ${p.songs.length} lagu (\`!play ${p.name}\`)`).join('\n');
     return message.reply(`📂 **Daftar Playlist Tersedia:**\n${list}\n\n*Ketik \`!play <nama playlist>\` untuk memutar!*`);
   }
 
-  // 5. LIHAT LAGU DI SATU PLAYLIST (!playlist <nama>)
-  if (message.content.startsWith('!playlist')) {
-    const playlistName = message.content.split(' ').slice(1).join(' ').trim();
-    if (!playlistName) return message.reply('⚠️ Ketik: `!playlist <nama playlist>` (contoh: `!playlist Pop`).');
-
-    const playlists = getPlaylists();
-    const p = playlists.find(x => x.name.toLowerCase() === playlistName.toLowerCase());
-    if (!p) return message.reply(`❌ Playlist **${playlistName}** tidak ditemukan.`);
-    if (p.songs.length === 0) return message.reply(`📂 Playlist **${p.name}** masih kosong.`);
-
-    const list = p.songs.map((s, i) => `${i + 1}. 🎵 \`${s}\``).join('\n');
-    return message.reply(`📂 **Lagu di Playlist "${p.name}":**\n${list}\n\n*Putar semua lagu dengan: \`!play ${p.name}\`*`);
-  }
-
-  // 6. PUTAR LAGU / PLAYLIST (!play <nama>)
+  // 5. PUTAR LAGU / PLAYLIST (!play <nama>)
   if (message.content.startsWith('!play')) {
     const query = message.content.split(' ').slice(1).join(' ').trim();
-    if (!query) return message.reply('⚠️ Gunakan: `!play <nama playlist>` atau `!play <nama lagu>`.');
+    if (!query) {
+      return message.reply('⚠️ Masukkan judul lagu atau nama playlist!\n💡 *Contoh: `!play Pop` atau coba radio live: `!radio lofi`*');
+    }
 
-    const voiceChannel = message.member.voice.channel;
+    const voiceChannel = message.member?.voice?.channel;
     if (!voiceChannel) return message.reply('⚠️ Kamu harus masuk ke Voice Channel terlebih dahulu!');
 
-    connectVoice(message, voiceChannel);
-
-    // Cek nama playlist (folder)
+    // Cek Playlist (Folder)
     const playlists = getPlaylists();
     const matchedPlaylist = playlists.find(p => p.name.toLowerCase() === query.toLowerCase());
 
     if (matchedPlaylist) {
       if (matchedPlaylist.songs.length === 0) return message.reply(`⚠️ Playlist **${matchedPlaylist.name}** kosong.`);
 
+      connectVoice(message, voiceChannel);
       const wasEmpty = mgr.musicQueue.length === 0 && !mgr.currentTrack;
       for (const song of matchedPlaylist.songs) {
         mgr.musicQueue.push({
@@ -446,9 +435,10 @@ client.on('messageCreate', async message => {
       return;
     }
 
-    // Cek lagu tunggal
+    // Cek Lagu Tunggal
     const singleSong = findSingleSong(query);
     if (singleSong) {
+      connectVoice(message, voiceChannel);
       const wasEmpty = mgr.musicQueue.length === 0 && !mgr.currentTrack;
       mgr.musicQueue.push({ title: singleSong.title, path: singleSong.path, type: 'file' });
 
@@ -461,10 +451,10 @@ client.on('messageCreate', async message => {
       return;
     }
 
-    return message.reply(`❌ Tidak ditemukan lagu atau playlist **"${query}"**.`);
+    return message.reply(`❌ Tidak ditemukan file musik atau playlist **"${query}"** di folder Music.\n💡 *Tips: Untuk memutar musik streaming tanpa upload lagu, ketik: \`!radio lofi\`*`);
   }
 
-  // 7. QUEUE LENGKAP (!queue)
+  // 6. QUEUE (!queue)
   if (message.content === '!queue') {
     if (!mgr.currentTrack && mgr.musicQueue.length === 0) return message.reply('📭 Antrean musik saat ini kosong.');
 
@@ -480,9 +470,9 @@ client.on('messageCreate', async message => {
     return message.reply(text);
   }
 
-  // 8. VERIFIKASI (Admin)
+  // 7. SETUP VERIFIKASI (Admin)
   if (message.content === '!setup-verify') {
-    if (!message.member.permissions.has('Administrator')) return message.reply('❌ Khusus Admin.');
+    if (!message.member?.permissions.has('Administrator')) return message.reply('❌ Khusus Admin.');
     const embed = new EmbedBuilder()
       .setTitle('🛡️ Verifikasi Member')
       .setDescription('Selamat datang!\nKlik tombol **Verifikasi** di bawah untuk membuka akses channel.\n*Syarat: Umur akun minimal 30 hari.*')
@@ -497,10 +487,11 @@ client.on('messageCreate', async message => {
   }
 });
 
-// --- INTERAKSI TOMBOL CONTROLLER (PER SERVER) ---
+// --- 6. INTERAKSI TOMBOL (CONTROLLER & VERIFY) ---
 client.on('interactionCreate', async interaction => {
   if (!interaction.isButton()) return;
-  const guildId = interaction.guild.id;
+  const guildId = interaction.guild?.id;
+  if (!guildId) return;
   const mgr = getGuildManager(guildId);
 
   // Verifikasi Member
@@ -526,9 +517,9 @@ client.on('interactionCreate', async interaction => {
     }
   }
 
-  // Tombol Musik (Khusus Server Ini Saja)
+  // Tombol Musik Player
   if (interaction.customId.startsWith('btn_player_')) {
-    const voiceChannel = interaction.member.voice.channel;
+    const voiceChannel = interaction.member?.voice?.channel;
     if (!voiceChannel) {
       return interaction.reply({ content: '⚠️ Kamu harus berada di Voice Channel!', ephemeral: true });
     }
@@ -618,4 +609,8 @@ client.on('interactionCreate', async interaction => {
   }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+// --- 7. LOGIN DISCORD DENGAN LOG JELAS ---
+console.log('🤖 Menghubungkan bot ke Discord...');
+client.login(process.env.DISCORD_TOKEN).catch(err => {
+  console.error('❌ GAGAL LOGIN KE DISCORD! Periksa DISCORD_TOKEN atau Privileged Intents:', err.message);
+});

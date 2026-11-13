@@ -25,7 +25,8 @@ const {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
-  MessageFlags
+  MessageFlags,
+  PermissionFlagsBits
 } = require('discord.js');
 const {
   joinVoiceChannel,
@@ -33,79 +34,117 @@ const {
   createAudioPlayer,
   createAudioResource,
   entersState,
+  demuxProbe, // FIX: sebelumnya dipakai di !radio tapi tidak di-import
+  generateDependencyReport,
   AudioPlayerStatus,
   VoiceConnectionStatus,
-  StreamType,
-  generateDependencyReport
+  StreamType
 } = require('@discordjs/voice');
 
-// Helper untuk konversi Cookie (Mendukung Header String & Format JSON)
-function parseCookieString(raw) {
-  if (!raw) return '';
+// FIX: Tampilkan laporan dependency voice saat start.
+// Jika baris "Opus Libraries", "Encryption Libraries", atau "DAVE Protocol Libraries"
+// berisi "not found", bot TIDAK akan mengeluarkan suara.
+console.log('🔎 Voice Dependency Report:\n' + generateDependencyReport());
+
+// --- Helper Cookie YouTube (Header String / JSON) -> array cookie untuk ytdl.createAgent ---
+function parseCookieArray(raw) {
+  if (!raw) return [];
   raw = raw.trim();
   if (raw.startsWith('[') || raw.startsWith('{')) {
     try {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
-        return parsed
-          .filter(c => c && c.name && c.value)
-          .map(c => `${c.name}=${c.value}`)
-          .join('; ');
-      } else if (typeof parsed === 'object') {
-        return Object.entries(parsed)
-          .map(([k, v]) => `${k}=${v}`)
-          .join('; ');
+        return parsed.filter(c => c && c.name && c.value !== undefined);
+      }
+      if (parsed && typeof parsed === 'object') {
+        return Object.entries(parsed).map(([name, value]) => ({ name, value: String(value), domain: '.youtube.com' }));
       }
     } catch (e) {
-      console.warn('⚠️ Gagal parse JSON cookie, menggunakan raw string.');
+      console.warn('⚠️ Gagal parse JSON cookie, mencoba format header string.');
     }
   }
-  return raw;
+  return raw
+    .split(';')
+    .map(p => p.trim())
+    .filter(Boolean)
+    .map(p => {
+      const i = p.indexOf('=');
+      if (i <= 0) return null;
+      return { name: p.slice(0, i).trim(), value: p.slice(i + 1).trim(), domain: '.youtube.com' };
+    })
+    .filter(Boolean);
 }
 
-// Inisialisasi Engine YouTube Modern (@distube/ytdl-core)
-let ytdlModule = null;
-let ytCookieInstance = null;
-let ytAnonymousInstance = null;
-
+// --- Engine YouTube (@distube/ytdl-core) ---
+// FIX: Kode lama memakai API `new ytdl.Ytdl()`, `ytdl.Client.Tv`, `ytdl.Quality.HighestAudio`
+// yang TIDAK ADA di @distube/ytdl-core, sehingga YouTube selalu gagal diam-diam.
+let ytdl = null;
 try {
-  ytdlModule = require('@distube/ytdl-core');
-  console.log('✅ Engine YouTube Modern (@distube/ytdl-core) berhasil dimuat!');
+  ytdl = require('@distube/ytdl-core');
+  console.log('✅ Engine YouTube (@distube/ytdl-core) berhasil dimuat!');
 } catch (e) {
-  console.log('ℹ️ @distube/ytdl-core belum terpasang di package.json.');
+  console.log('ℹ️ @distube/ytdl-core belum terpasang, YouTube dinonaktifkan (fallback SoundCloud).');
 }
 
-function getYouTubeInstance(withCookie = true) {
-  if (!ytdlModule) return null;
-  const rawCookie = process.env.YOUTUBE_COOKIE;
-  const cookieStr = rawCookie ? parseCookieString(rawCookie) : '';
+let ytAgent = null; // null = belum dibuat, false = tanpa cookie
+function getYtAgent() {
+  if (!ytdl) return undefined;
+  if (ytAgent !== null) return ytAgent || undefined;
+  const cookies = parseCookieArray(process.env.YOUTUBE_COOKIE);
+  try {
+    ytAgent = cookies.length ? ytdl.createAgent(cookies) : false;
+    if (ytAgent) console.log(`🍪 YouTube agent dengan ${cookies.length} cookie aktif.`);
+  } catch (e) {
+    console.warn('⚠️ Gagal membuat YouTube agent dari cookie:', e.message);
+    ytAgent = false;
+  }
+  return ytAgent || undefined;
+}
 
-  const clientList = ytdlModule.Client ? [
-    ytdlModule.Client.Tv,
-    ytdlModule.Client.WebEmbedded,
-    ytdlModule.Client.VisionOS
-  ] : undefined;
-
-  if (withCookie && cookieStr) {
-    if (!ytCookieInstance) {
-      ytCookieInstance = new ytdlModule.Ytdl({
-        cookie: cookieStr,
-        ...(clientList ? { clients: clientList } : {}),
-        lang: 'id',
-        country: 'ID'
-      });
+async function getYouTubeInfo(url) {
+  const agent = getYtAgent();
+  if (agent) {
+    try {
+      return await ytdl.getInfo(url, { agent });
+    } catch (e) {
+      console.warn('[YouTube Cookie Info Warning]:', e.message);
     }
-    return ytCookieInstance;
   }
+  try {
+    return await ytdl.getInfo(url);
+  } catch (e) {
+    console.warn('[YouTube Anonymous Info Warning]:', e.message);
+    return null;
+  }
+}
 
-  if (!ytAnonymousInstance) {
-    ytAnonymousInstance = new ytdlModule.Ytdl({
-      ...(clientList ? { clients: clientList } : {}),
-      lang: 'id',
-      country: 'ID'
-    });
-  }
-  return ytAnonymousInstance;
+function createYouTubeStream(url) {
+  const agent = getYtAgent();
+  // ytdl(url) mengambil info baru saat diputar, jadi URL format tidak kedaluwarsa walau lama di antrean
+  return ytdl(url, {
+    filter: 'audioonly',
+    quality: 'highestaudio',
+    highWaterMark: 1 << 25,
+    dlChunkSize: 0,
+    ...(agent ? { agent } : {})
+  });
+}
+
+// Membungkus stream apa pun dengan FFmpeg + seek (-ss), output PCM mentah untuk Discord
+function createSeekedResource(inputStream, seconds) {
+  const transcoder = new prism.FFmpeg({
+    args: [
+      '-analyzeduration', '0',
+      '-loglevel', '0',
+      '-ss', String(Math.max(0, Math.floor(seconds))),
+      '-f', 's16le',
+      '-ar', '48000',
+      '-ac', '2'
+    ]
+  });
+  inputStream.on('error', err => console.warn('Seek input stream error:', err.message));
+  transcoder.on('error', err => console.warn('Seek ffmpeg error:', err.message));
+  return createAudioResource(inputStream.pipe(transcoder), { inputType: StreamType.Raw });
 }
 
 // Inisialisasi SoundCloud
@@ -115,11 +154,7 @@ async function ensureSoundCloud() {
   try {
     const clientID = await play.getFreeClientID();
     if (clientID) {
-      await play.setToken({
-        soundcloud: {
-          client_id: clientID
-        }
-      });
+      await play.setToken({ soundcloud: { client_id: clientID } });
       scInitialized = true;
       console.log('✅ Token SoundCloud aktif.');
       return true;
@@ -195,7 +230,7 @@ const client = new Client({
   ]
 });
 
-// --- 5. ENGINE PENCARIAN MUSIK ONLINE (YOUTUBE HD + SMART SOUNDCLOUD FALLBACK) ---
+// --- 5. ENGINE PENCARIAN MUSIK ONLINE (YOUTUBE + SOUNDCLOUD FALLBACK) ---
 async function searchOnlineTrack(query) {
   // Cek jika input adalah link Spotify
   try {
@@ -208,78 +243,60 @@ async function searchOnlineTrack(query) {
     }
   } catch (err) {}
 
-  // 1. ENGINE UTAMA: YOUTUBE DENGAN @distube/ytdl-core
-  if (ytdlModule) {
+  // 1. ENGINE UTAMA: YOUTUBE
+  if (ytdl) {
     try {
-      const searchRes = await yts(query);
-      if (searchRes && searchRes.videos && searchRes.videos.length > 0) {
-        const v = searchRes.videos[0];
-        
-        let info = null;
-        let yt = getYouTubeInstance(true);
+      let videoUrl = null;
+      let fallbackTitle = query;
+      let fallbackSeconds = 0;
 
-        if (yt) {
-          try {
-            info = await yt.getInfo(v.url);
-          } catch (cErr) {
-            console.warn('[YouTube Cookie Info Warning]:', cErr.message);
-            const anonYt = getYouTubeInstance(false);
-            if (anonYt) {
-              try {
-                info = await anonYt.getInfo(v.url);
-              } catch (aErr) {
-                console.warn('[YouTube Anonymous Info Warning]:', aErr.message);
-              }
-            }
-          }
-        } else {
-          yt = getYouTubeInstance(false);
-          if (yt) {
-            try {
-              info = await yt.getInfo(v.url);
-            } catch (aErr) {
-              console.warn('[YouTube Anonymous Info Warning]:', aErr.message);
-            }
-          }
+      if (ytdl.validateURL(query)) {
+        videoUrl = query;
+      } else {
+        const searchRes = await yts(query);
+        const v = searchRes?.videos?.[0];
+        if (v) {
+          videoUrl = v.url;
+          fallbackTitle = v.title;
+          fallbackSeconds = v.seconds || 0;
         }
+      }
 
+      if (videoUrl) {
+        const info = await getYouTubeInfo(videoUrl);
         if (info) {
           return {
-            title: info.videoDetails?.title || v.title,
-            url: v.url,
-            info: info,
-            duration: parseInt(info.videoDetails?.lengthSeconds, 10) || v.seconds || 0,
+            title: info.videoDetails?.title || fallbackTitle,
+            url: videoUrl,
+            duration: parseInt(info.videoDetails?.lengthSeconds, 10) || fallbackSeconds,
             type: 'online',
             sourceName: 'YouTube HD'
           };
         }
       }
     } catch (ytErr) {
-      console.warn('[YouTube Modern Engine Warning]:', ytErr.message);
+      console.warn('[YouTube Engine Warning]:', ytErr.message);
     }
   }
 
-    // 2. FALLBACK KE SOUNDCLOUD (Validasi langsung agar tidak terkena Go+ 404)
+  // 2. FALLBACK KE SOUNDCLOUD (validasi stream agar tidak terkena Go+ 404)
   await ensureSoundCloud();
   try {
     const scResults = await play.search(query, { limit: 5, source: { soundcloud: 'tracks' } });
-    if (scResults && scResults.length > 0) {
-      for (const t of scResults) {
-        try {
-          const testStream = await play.stream(t.url).catch(() => null);
-          if (!testStream || !testStream.stream) continue;
+    for (const t of scResults || []) {
+      const testStream = await play.stream(t.url).catch(() => null);
+      if (!testStream || !testStream.stream) continue;
+      // Tutup stream tes; stream baru dibuat saat lagu benar-benar diputar
+      testStream.stream.destroy?.();
 
-          const durationSec = t.durationInSec || (t.durationInMs ? Math.floor(t.durationInMs / 1000) : 0);
-          return {
-            title: t.name || t.title,
-            url: t.url,
-            duration: durationSec,
-            type: 'online',
-            sourceName: 'SoundCloud',
-            preloadedStream: testStream.stream
-          };
-        } catch (streamErr) {}
-      }
+      const durationSec = t.durationInSec || (t.durationInMs ? Math.floor(t.durationInMs / 1000) : 0);
+      return {
+        title: t.name || t.title,
+        url: t.url,
+        duration: durationSec,
+        type: 'online',
+        sourceName: 'SoundCloud'
+      };
     }
   } catch (scErr) {
     console.warn('[SoundCloud Search Warning]:', scErr.message);
@@ -298,8 +315,7 @@ function getAudioDuration(filePath) {
         const hours = parseInt(match[1], 10);
         const mins = parseInt(match[2], 10);
         const secs = parseFloat(match[3]);
-        const total = Math.floor(hours * 3600 + mins * 60 + secs);
-        return resolve(total);
+        return resolve(Math.floor(hours * 3600 + mins * 60 + secs));
       }
       resolve(0);
     });
@@ -317,11 +333,7 @@ function createProgressBar(currentSec, totalSec, barSize = 16) {
 
   let bar = '';
   for (let i = 0; i < barSize; i++) {
-    if (i === progressIndex) {
-      bar += '🔘';
-    } else {
-      bar += '▬';
-    }
+    bar += i === progressIndex ? '🔘' : '▬';
   }
   return bar;
 }
@@ -342,22 +354,22 @@ function getGuildManager(guildId) {
       lastPlayerMessage: null,
       progressInterval: null,
       isTransitioning: false,
-      isHandlingError: false
+      isHandlingError: false,
+      destroyed: false
     };
 
+    // Log setiap perubahan state agar mudah debug di Railway
+    newPlayer.on('stateChange', (oldS, newS) => {
+      console.log(`[Server ${guildId}] Player: ${oldS.status} -> ${newS.status}`);
+    });
+
     newPlayer.on(AudioPlayerStatus.Playing, () => {
-      console.log(`[Server ${guildId}] 🔊 Audio Player: Sedang memutar suara!`);
       startProgressTicker(guildId);
     });
 
-    newPlayer.on(AudioPlayerStatus.Buffering, () => {
-      console.log(`[Server ${guildId}] ⏳ Audio Player: Sedang buffering...`);
-    });
-
     newPlayer.on(AudioPlayerStatus.Idle, () => {
-      console.log(`[Server ${guildId}] Lagu selesai, lanjut ke berikutnya...`);
       stopProgressTicker(guildId);
-      if (mgr.isHandlingError) return;
+      if (mgr.destroyed || mgr.isHandlingError) return;
       if (mgr.isLoopQueue && mgr.currentTrack && mgr.currentTrack.type === 'file') {
         mgr.musicQueue.push(mgr.currentTrack);
       }
@@ -367,26 +379,29 @@ function getGuildManager(guildId) {
     newPlayer.on('error', async error => {
       console.error(`[Server ${guildId}] ❌ Audio Error:`, error.message);
       stopProgressTicker(guildId);
-      if (mgr.isHandlingError) return;
+      if (mgr.destroyed || mgr.isHandlingError) return;
       mgr.isHandlingError = true;
 
       if (mgr.currentTrack && mgr.currentTrack.sourceName === 'YouTube HD') {
-        console.log(`[Server ${guildId}] 🔄 YouTube stream drop, mencoba fallback otomatis ke SoundCloud...`);
+        console.log(`[Server ${guildId}] 🔄 YouTube stream drop, mencoba fallback ke SoundCloud...`);
         try {
+          await ensureSoundCloud();
           const scResult = await play.search(mgr.currentTrack.title, { limit: 3, source: { soundcloud: 'tracks' } });
           for (const t of scResult) {
             try {
               const scStream = await play.stream_from_info(t);
               if (scStream && scStream.stream) {
-                console.log(`[Server ${guildId}] ✅ Berhasil beralih ke SoundCloud: "${t.name || t.title}"`);
+                console.log(`[Server ${guildId}] ✅ Beralih ke SoundCloud: "${t.name || t.title}"`);
                 mgr.currentTrack.title = t.name || t.title;
                 mgr.currentTrack.url = t.url;
                 mgr.currentTrack.sourceName = 'SoundCloud';
+                mgr.currentTrack.startedAt = Date.now();
+                mgr.currentTrack.seekOffset = 0;
                 scStream.stream.on('error', err => console.warn('SoundCloud stream error:', err.message));
-                const resource = createAudioResource(scStream.stream, { inputType: StreamType.Arbitrary, inlineVolume: false });
+                const resource = createAudioResource(scStream.stream, { inputType: scStream.type ?? StreamType.Arbitrary });
+                mgr.isHandlingError = false;
                 mgr.player.play(resource);
                 await sendPlayerCard(guildId, mgr.currentTrack, false);
-                mgr.isHandlingError = false;
                 return;
               }
             } catch (e) {}
@@ -394,10 +409,8 @@ function getGuildManager(guildId) {
         } catch (scErr) {}
       }
 
-      setTimeout(() => {
-        mgr.isHandlingError = false;
-        playNextSong(guildId);
-      }, 500);
+      mgr.isHandlingError = false;
+      playNextSong(guildId);
     });
 
     guildManagers.set(guildId, mgr);
@@ -405,8 +418,20 @@ function getGuildManager(guildId) {
   return mgr;
 }
 
+function destroyGuildManager(guildId) {
+  const mgr = guildManagers.get(guildId);
+  if (!mgr) return;
+  mgr.destroyed = true;
+  stopProgressTicker(guildId);
+  mgr.musicQueue = [];
+  mgr.currentTrack = null;
+  mgr.player.stop(true);
+  guildManagers.delete(guildId);
+}
+
 function startProgressTicker(guildId) {
-  const mgr = getGuildManager(guildId);
+  const mgr = guildManagers.get(guildId);
+  if (!mgr) return;
   stopProgressTicker(guildId);
 
   mgr.progressInterval = setInterval(async () => {
@@ -440,18 +465,45 @@ function stopProgressTicker(guildId) {
 
 const MUSIC_DIR = path.join(__dirname, 'Music');
 
+// FIX: cek izin Connect & Speak sebelum join
+function checkVoicePermissions(voiceChannel) {
+  const me = voiceChannel.guild.members.me;
+  const perms = me ? voiceChannel.permissionsFor(me) : null;
+  if (!perms) return 'Tidak bisa membaca izin bot di voice channel ini.';
+  if (!perms.has(PermissionFlagsBits.Connect)) return `Bot tidak punya izin **Connect** di <#${voiceChannel.id}>.`;
+  if (!perms.has(PermissionFlagsBits.Speak)) return `Bot tidak punya izin **Speak** di <#${voiceChannel.id}>.`;
+  return null;
+}
+
+// FIX: Sekarang async dan MENUNGGU koneksi voice benar-benar "Ready" sebelum audio diputar.
+// Jika koneksi gagal (biasanya karena library enkripsi/DAVE belum terpasang), akan muncul error yang jelas.
 async function connectVoice(message, voiceChannel) {
   const guildId = message.guild.id;
   const mgr = getGuildManager(guildId);
   mgr.activeTextChannel = message.channel;
 
+  const permError = checkVoicePermissions(voiceChannel);
+  if (permError) throw new Error(permError);
+
   let connection = getVoiceConnection(guildId);
-  if (!connection || connection.state.status === VoiceConnectionStatus.Destroyed) {
+  if (connection && connection.state.status === VoiceConnectionStatus.Destroyed) {
+    connection = null;
+  }
+
+  if (!connection) {
     connection = joinVoiceChannel({
       channelId: voiceChannel.id,
       guildId: guildId,
       adapterCreator: message.guild.voiceAdapterCreator,
       selfDeaf: true
+    });
+
+    connection.on('stateChange', (oldS, newS) => {
+      console.log(`[Server ${guildId}] Voice: ${oldS.status} -> ${newS.status}`);
+    });
+
+    connection.on('error', err => {
+      console.error(`[Server ${guildId}] Voice connection error:`, err.message);
     });
 
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
@@ -462,22 +514,23 @@ async function connectVoice(message, voiceChannel) {
         ]);
       } catch (e) {
         connection.destroy();
+        destroyGuildManager(guildId);
       }
     });
   }
 
-  // Pastikan koneksi voice telah mencapai status READY sebelum mengirim audio
+  connection.subscribe(mgr.player);
+
   try {
-    if (connection.state.status !== VoiceConnectionStatus.Ready) {
-      console.log(`[Server ${guildId}] ⏳ Menunggu Voice Connection READY...`);
-      await entersState(connection, VoiceConnectionStatus.Ready, 15000);
-      console.log(`[Server ${guildId}] 🔊 Voice Connection READY! Mengikat audio player...`);
-    }
-  } catch (connErr) {
-    console.error(`[Server ${guildId}] ⚠️ Voice Connection timeout / belum ready:`, connErr.message);
+    await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+  } catch (e) {
+    connection.destroy();
+    throw new Error(
+      'Gagal tersambung ke voice channel dalam 20 detik. Cek log "Voice Dependency Report" ' +
+      '(opus / sodium / DAVE harus "found") dan pastikan @discordjs/voice versi terbaru.'
+    );
   }
 
-  connection.subscribe(mgr.player);
   return connection;
 }
 
@@ -526,12 +579,11 @@ function findSingleSong(query) {
   if (!fs.existsSync(MUSIC_DIR)) return null;
   const q = query.toLowerCase();
   const rootFiles = fs.readdirSync(MUSIC_DIR).filter(f => f.endsWith('.mp3') || f.endsWith('.wav') || f.endsWith('.ogg'));
-  let match = rootFiles.find(f => f.toLowerCase() === q || f.toLowerCase() === `${q}.mp3` || f.toLowerCase().includes(q));
+  const match = rootFiles.find(f => f.toLowerCase() === q || f.toLowerCase() === `${q}.mp3` || f.toLowerCase().includes(q));
   if (match) return { title: match, path: path.join(MUSIC_DIR, match) };
 
-  const playlists = getPlaylists();
-  for (const p of playlists) {
-    let pMatch = p.songs.find(f => f.toLowerCase() === q || f.toLowerCase() === `${q}.mp3` || f.toLowerCase().includes(q));
+  for (const p of getPlaylists()) {
+    const pMatch = p.songs.find(f => f.toLowerCase() === q || f.toLowerCase() === `${q}.mp3` || f.toLowerCase().includes(q));
     if (pMatch) {
       return { title: `${pMatch} (${p.name})`, path: path.join(p.path, pMatch) };
     }
@@ -553,18 +605,41 @@ const RADIO_STATIONS = {
   hardrock: { name: 'Hard Rock FM', url: 'https://stream.zeno.fm/u2213718v8zuv' }
 };
 
-function fetchAudioStream(url, callback) {
-  const lib = url.startsWith('https') ? https : http;
-  lib.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, res => {
-    if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-      return fetchAudioStream(res.headers.location, callback);
-    }
-    callback(res);
-  }).on('error', err => console.error('Stream Error:', err.message));
+// FIX: versi Promise + cek status HTTP (sebelumnya error stream radio hilang begitu saja)
+function fetchAudioStream(url, redirects = 0) {
+  return new Promise((resolve, reject) => {
+    if (redirects > 5) return reject(new Error('Terlalu banyak redirect'));
+    const lib = url.startsWith('https') ? https : http;
+    lib.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, res => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        const next = new URL(res.headers.location, url).toString();
+        return resolve(fetchAudioStream(next, redirects + 1));
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      resolve(res);
+    }).on('error', reject);
+  });
+}
+
+async function playRadioStream(mgr, url) {
+  const stream = await fetchAudioStream(url);
+  stream.on('error', err => console.warn('Radio stream error:', err.message));
+  let resource;
+  try {
+    const probed = await demuxProbe(stream);
+    resource = createAudioResource(probed.stream, { inputType: probed.type });
+  } catch {
+    resource = createAudioResource(stream, { inputType: StreamType.Arbitrary });
+  }
+  mgr.player.play(resource);
 }
 
 async function executeSeek(guildId, targetSeconds) {
-  const mgr = getGuildManager(guildId);
+  const mgr = guildManagers.get(guildId);
   if (!mgr || !mgr.currentTrack || mgr.currentTrack.type === 'stream') return false;
 
   mgr.currentTrack.seekOffset = Math.max(0, targetSeconds);
@@ -574,46 +649,34 @@ async function executeSeek(guildId, targetSeconds) {
   const conn = getVoiceConnection(guildId);
   if (conn) conn.subscribe(mgr.player);
 
-  if (mgr.currentTrack.type === 'file') {
-    const ffmpeg = new prism.FFmpeg({
-      args: [
-        '-ss', String(mgr.currentTrack.seekOffset),
-        '-i', mgr.currentTrack.path,
-        '-analyzeduration', '0',
-        '-loglevel', '0',
-        '-f', 's16le',
-        '-ar', '48000',
-        '-ac', '2'
-      ]
-    });
-
-    const resource = createAudioResource(ffmpeg, {
-      inputType: StreamType.Raw
-    });
-    mgr.player.play(resource);
-  } else if (mgr.currentTrack.type === 'online') {
-    try {
-      if (mgr.currentTrack.sourceName === 'YouTube HD' && ytdlModule) {
-        const yt = getYouTubeInstance(true) || getYouTubeInstance(false);
-        const downloadTarget = mgr.currentTrack.info || mgr.currentTrack.url;
-        const rawStream = yt.download(downloadTarget, {
-          quality: ytdlModule.Quality.HighestAudio,
-          filter: 'audioonly',
-          begin: `${Math.floor(targetSeconds)}s`,
-          highWaterMark: 1 << 25
-        });
-        rawStream.on('error', err => console.warn('Seek stream error:', err.message));
-        const resource = createAudioResource(rawStream, { inputType: StreamType.Arbitrary, inlineVolume: false });
-        mgr.player.play(resource);
+  try {
+    if (mgr.currentTrack.type === 'file') {
+      const ffmpeg = new prism.FFmpeg({
+        args: [
+          '-ss', String(mgr.currentTrack.seekOffset),
+          '-i', mgr.currentTrack.path,
+          '-analyzeduration', '0',
+          '-loglevel', '0',
+          '-f', 's16le',
+          '-ar', '48000',
+          '-ac', '2'
+        ]
+      });
+      mgr.player.play(createAudioResource(ffmpeg, { inputType: StreamType.Raw }));
+    } else if (mgr.currentTrack.type === 'online') {
+      let source;
+      if (mgr.currentTrack.sourceName === 'YouTube HD' && ytdl) {
+        source = createYouTubeStream(mgr.currentTrack.url);
       } else {
-        const stream = await play.stream(mgr.currentTrack.url, { seek: targetSeconds });
-        stream.stream.on('error', err => console.warn('Seek stream error:', err.message));
-        const resource = createAudioResource(stream.stream, { inputType: StreamType.Arbitrary, inlineVolume: false });
-        mgr.player.play(resource);
+        await ensureSoundCloud();
+        source = (await play.stream(mgr.currentTrack.url)).stream;
       }
-    } catch (err) {
-      console.error('Seek online error:', err.message);
+      // FIX: seek lewat FFmpeg (opsi `begin` ytdl tidak berfungsi untuk video biasa)
+      mgr.player.play(createSeekedResource(source, mgr.currentTrack.seekOffset));
     }
+  } catch (err) {
+    console.error('Seek error:', err.message);
+    return false;
   }
 
   await sendPlayerCard(guildId, mgr.currentTrack, false);
@@ -628,8 +691,7 @@ function buildPlayerEmbed(mgr, track, isPaused = false) {
   let timeSection = '';
   if (totalSec > 0) {
     const totalPos = formatTime(totalSec);
-    const remainingSec = Math.max(0, totalSec - currentSec);
-    const remainingPos = formatTime(remainingSec);
+    const remainingPos = formatTime(Math.max(0, totalSec - currentSec));
     const percent = Math.min(100, Math.floor((currentSec / totalSec) * 100));
 
     timeSection =
@@ -658,7 +720,7 @@ function buildPlayerEmbed(mgr, track, isPaused = false) {
   return new EmbedBuilder()
     .setColor(isPaused ? '#FEE75C' : '#57F287')
     .setAuthor({ name: 'MUSIC PLAYER CONTROLLER' })
-    .setTitle(`🎶 ${track.title}`)
+    .setTitle(`🎶 ${track.title}`.slice(0, 256))
     .setDescription(
       `📌 **Status:** ${playerState}\n` +
       `📡 **Sumber:** \`${sourceLabel}\`\n\n` +
@@ -688,8 +750,8 @@ function buildPlayerButtons(mgr, isPaused = false) {
 }
 
 async function sendPlayerCard(guildId, track, isPaused = false) {
-  const mgr = getGuildManager(guildId);
-  if (!mgr.activeTextChannel) return;
+  const mgr = guildManagers.get(guildId);
+  if (!mgr || !mgr.activeTextChannel || !track) return;
   const embed = buildPlayerEmbed(mgr, track, isPaused);
   const rows = buildPlayerButtons(mgr, isPaused);
 
@@ -710,9 +772,12 @@ async function sendPlayerCard(guildId, track, isPaused = false) {
 }
 
 async function playNextSong(guildId) {
-  const mgr = getGuildManager(guildId);
+  const mgr = guildManagers.get(guildId);
+  if (!mgr || mgr.destroyed) return;
   if (mgr.isTransitioning) return;
   mgr.isTransitioning = true;
+
+  let failedTrack = null;
 
   try {
     stopProgressTicker(guildId);
@@ -735,79 +800,51 @@ async function playNextSong(guildId) {
     mgr.currentTrack.pausedAt = null;
     mgr.currentTrack.seekOffset = 0;
 
-    // Pastikan koneksi voice tersambung ke player
     const conn = getVoiceConnection(guildId);
-    if (conn) {
-      conn.subscribe(mgr.player);
-    }
+    if (conn) conn.subscribe(mgr.player);
 
-    if (mgr.currentTrack.type === 'file') {
-      if (!mgr.currentTrack.duration) {
-        mgr.currentTrack.duration = await getAudioDuration(mgr.currentTrack.path);
-      }
-      // Kirim path langsung ke createAudioResource agar discordjs/voice menanganinya secara native
-      const resource = createAudioResource(mgr.currentTrack.path);
-      mgr.player.play(resource);
-      await sendPlayerCard(guildId, mgr.currentTrack, false);
-      startProgressTicker(guildId);
-    } else if (mgr.currentTrack.type === 'online') {
-      try {
-        let rawStream = null;
-        if (mgr.currentTrack.sourceName === 'YouTube HD' && ytdlModule) {
-          const yt = getYouTubeInstance(true) || getYouTubeInstance(false);
-          const downloadTarget = mgr.currentTrack.info || mgr.currentTrack.url;
-          rawStream = yt.download(downloadTarget, {
-            quality: ytdlModule.Quality.HighestAudio,
-            filter: 'audioonly',
-            highWaterMark: 1 << 25
-          });
-          rawStream.on('error', err => {
-            console.warn(`[Server ${guildId}] YouTube stream chunk warning:`, err.message);
-          });
+    try {
+      if (mgr.currentTrack.type === 'file') {
+        if (!mgr.currentTrack.duration) {
+          mgr.currentTrack.duration = await getAudioDuration(mgr.currentTrack.path);
+        }
+        const fileStream = fs.createReadStream(mgr.currentTrack.path);
+        fileStream.on('error', err => console.warn('File stream error:', err.message));
+        mgr.player.play(createAudioResource(fileStream, { inputType: StreamType.Arbitrary }));
+      } else if (mgr.currentTrack.type === 'online') {
+        let resource;
+        if (mgr.currentTrack.sourceName === 'YouTube HD' && ytdl) {
+          const ytStream = createYouTubeStream(mgr.currentTrack.url);
+          ytStream.on('error', err => console.warn(`[Server ${guildId}] YouTube stream warning:`, err.message));
+          resource = createAudioResource(ytStream, { inputType: StreamType.Arbitrary });
         } else {
-          if (mgr.currentTrack.preloadedStream) {
-            rawStream = mgr.currentTrack.preloadedStream;
-            mgr.currentTrack.preloadedStream = null;
-          } else {
-            const scData = await play.stream(mgr.currentTrack.url);
-            rawStream = scData.stream;
-          }
-          rawStream.on('error', err => {
-            console.warn(`[Server ${guildId}] SoundCloud stream warning:`, err.message);
-          });
+          await ensureSoundCloud();
+          const scData = await play.stream(mgr.currentTrack.url);
+          scData.stream.on('error', err => console.warn(`[Server ${guildId}] SoundCloud stream warning:`, err.message));
+          resource = createAudioResource(scData.stream, { inputType: scData.type ?? StreamType.Arbitrary });
         }
-
-        // Gunakan StreamType.Arbitrary agar FFmpeg secara otomatis mendemux dan mengalirkan suara jernih ke Discord Voice
-        const resource = createAudioResource(rawStream, {
-          inputType: StreamType.Arbitrary,
-          inlineVolume: false
-        });
-
         mgr.player.play(resource);
-        await sendPlayerCard(guildId, mgr.currentTrack, false);
-        startProgressTicker(guildId);
-      } catch (err) {
-        console.error(`[Server ${guildId}] Error streaming online track:`, err.message);
-        if (mgr.activeTextChannel) {
-          mgr.activeTextChannel.send(`⚠️ Gagal memutar **${mgr.currentTrack.title}**: ${err.message}`).catch(() => {});
-        }
-        playNextSong(guildId);
+      } else if (mgr.currentTrack.type === 'stream') {
+        mgr.currentTrack.duration = 0;
+        await playRadioStream(mgr, mgr.currentTrack.url);
       }
-    } else if (mgr.currentTrack.type === 'stream') {
-      mgr.currentTrack.duration = 0;
-      fetchAudioStream(mgr.currentTrack.url, async stream => {
-        stream.on('error', err => console.warn('Radio stream error:', err.message));
-        const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary, inlineVolume: false });
-        mgr.player.play(resource);
-      });
+
       await sendPlayerCard(guildId, mgr.currentTrack, false);
-      startProgressTicker(guildId);
+    } catch (err) {
+      console.error(`[Server ${guildId}] Error memutar track:`, err.message);
+      failedTrack = mgr.currentTrack;
+      if (mgr.activeTextChannel) {
+        mgr.activeTextChannel.send(`⚠️ Gagal memutar **${failedTrack.title}**: ${err.message}`).catch(() => {});
+      }
     }
   } finally {
-    setTimeout(() => {
-      mgr.isTransitioning = false;
-    }, 500);
+    // FIX: reset langsung (sebelumnya pakai setTimeout 500ms, sehingga jika lagu gagal cepat,
+    // event Idle diabaikan dan bot diam selamanya)
+    mgr.isTransitioning = false;
   }
+
+  // FIX: sebelumnya playNextSong dipanggil rekursif saat isTransitioning masih true -> tidak pernah jalan
+  if (failedTrack) setImmediate(() => playNextSong(guildId));
 }
 
 // --- 7. EVENT LISTENERS DISCORD ---
@@ -819,7 +856,6 @@ client.once('clientReady', () => {
 client.on('messageCreate', async message => {
   if (message.author.bot || !message.guild) return;
   const guildId = message.guild.id;
-  const mgr = getGuildManager(guildId);
 
   // ==========================================
   // FITUR ABSENSI MEMBER (!absen & !logabsen)
@@ -863,9 +899,9 @@ client.on('messageCreate', async message => {
       .setColor('#57F287')
       .setAuthor({
         name: 'PRESENSI / ABSENSI BERHASIL',
-        iconURL: message.author.displayAvatarURL({ dynamic: true })
+        iconURL: message.author.displayAvatarURL()
       })
-      .setThumbnail(message.author.displayAvatarURL({ dynamic: true, size: 256 }))
+      .setThumbnail(message.author.displayAvatarURL({ size: 256 }))
       .setTitle(`✅ Kehadiran Terverifikasi: ${attendanceRecord.displayName}`)
       .setDescription(
         `Terima kasih telah hadir di server hari ini!\n\n` +
@@ -899,8 +935,7 @@ client.on('messageCreate', async message => {
       targetDateKey = nowWIB.dateKey;
       targetDateLabel = `Hari Ini (${nowWIB.dateFormatted})`;
     } else if (subParam === 'kemarin') {
-      const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
-      const yWIB = getWIBTime(yesterday);
+      const yWIB = getWIBTime(new Date(Date.now() - 24 * 60 * 60 * 1000));
       targetDateKey = yWIB.dateKey;
       targetDateLabel = `Kemarin (${yWIB.dateFormatted})`;
     } else if (subParam === 'riwayat') {
@@ -909,8 +944,7 @@ client.on('messageCreate', async message => {
         return message.channel.send('📭 Belum ada riwayat absensi yang tersimpan di server ini.');
       }
       const historySummary = availableDates.slice(0, 7).map(d => {
-        const count = guildData[d].length;
-        return `• 📅 \`${d}\` ➔ **${count} member hadir**`;
+        return `• 📅 \`${d}\` ➔ **${guildData[d].length} member hadir**`;
       }).join('\n');
 
       const historyEmbed = new EmbedBuilder()
@@ -954,7 +988,7 @@ client.on('messageCreate', async message => {
       .setColor('#5865F2')
       .setTitle(`📋 Rekap Presensi: ${targetDateLabel}`)
       .setDescription(
-        `Berikut daftar member yang hadir di server hari ini:\n\n` +
+        `Berikut daftar member yang hadir:\n\n` +
         attendeeLines.join('\n') +
         `\n\n📊 **Total Kehadiran:** \`${list.length} member\``
       )
@@ -980,7 +1014,13 @@ client.on('messageCreate', async message => {
     const voiceChannel = message.member?.voice?.channel;
     if (!voiceChannel) return message.reply('⚠️ Kamu harus masuk ke Voice Channel terlebih dahulu!');
 
-    await connectVoice(message, voiceChannel);
+    try {
+      await connectVoice(message, voiceChannel);
+    } catch (err) {
+      return message.reply(`❌ ${err.message}`);
+    }
+
+    const mgr = getGuildManager(guildId);
     const station = RADIO_STATIONS[stationKey];
     mgr.musicQueue = [];
     mgr.currentTrack = {
@@ -992,19 +1032,14 @@ client.on('messageCreate', async message => {
       seekOffset: 0
     };
 
-    fetchAudioStream(station.url, async stream => {
-      try {
-        const { stream: probedStream, type } = await demuxProbe(stream);
-        const resource = createAudioResource(probedStream, { inputType: type });
-        mgr.player.play(resource);
-      } catch {
-        const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary });
-        mgr.player.play(resource);
-      }
-    });
+    try {
+      await playRadioStream(mgr, station.url);
+    } catch (err) {
+      mgr.currentTrack = null;
+      return message.reply(`❌ Gagal membuka stream radio **${station.name}**: ${err.message}`);
+    }
 
     await sendPlayerCard(guildId, mgr.currentTrack, false);
-    startProgressTicker(guildId);
     return;
   }
 
@@ -1018,7 +1053,7 @@ client.on('messageCreate', async message => {
   // ==========================================
   // COMMAND: !play (ONLINE SEARCH + FOLDER LOCAL)
   // ==========================================
-  if (message.content.startsWith('!play')) {
+  if (message.content === '!play' || message.content.startsWith('!play ')) {
     const query = message.content.split(' ').slice(1).join(' ').trim();
     if (!query) {
       return message.reply('⚠️ Masukkan judul lagu atau link!\n💡 *Contoh: `!play sial mahalini` atau `!radio lofi`*');
@@ -1027,20 +1062,22 @@ client.on('messageCreate', async message => {
     const voiceChannel = message.member?.voice?.channel;
     if (!voiceChannel) return message.reply('⚠️ Kamu harus masuk ke Voice Channel terlebih dahulu!');
 
+    const mgr = getGuildManager(guildId);
+
     // 1. Cek Folder Playlist Lokal
-    const playlists = getPlaylists();
-    const matchedPlaylist = playlists.find(p => p.name.toLowerCase() === query.toLowerCase());
+    const matchedPlaylist = getPlaylists().find(p => p.name.toLowerCase() === query.toLowerCase());
     if (matchedPlaylist) {
       if (matchedPlaylist.songs.length === 0) return message.reply(`⚠️ Playlist **${matchedPlaylist.name}** kosong.`);
 
-      await connectVoice(message, voiceChannel);
+      try {
+        await connectVoice(message, voiceChannel);
+      } catch (err) {
+        return message.reply(`❌ ${err.message}`);
+      }
+
       const wasEmpty = mgr.musicQueue.length === 0 && !mgr.currentTrack;
       for (const song of matchedPlaylist.songs) {
-        mgr.musicQueue.push({
-          title: song,
-          path: path.join(matchedPlaylist.path, song),
-          type: 'file'
-        });
+        mgr.musicQueue.push({ title: song, path: path.join(matchedPlaylist.path, song), type: 'file' });
       }
 
       message.reply(`📁 Berhasil memuat **${matchedPlaylist.songs.length} lagu** dari playlist **${matchedPlaylist.name}**! 🎶`);
@@ -1055,7 +1092,12 @@ client.on('messageCreate', async message => {
     // 2. Cek File Lagu Lokal
     const singleSong = findSingleSong(query);
     if (singleSong) {
-      await connectVoice(message, voiceChannel);
+      try {
+        await connectVoice(message, voiceChannel);
+      } catch (err) {
+        return message.reply(`❌ ${err.message}`);
+      }
+
       const wasEmpty = mgr.musicQueue.length === 0 && !mgr.currentTrack;
       mgr.musicQueue.push({ title: singleSong.title, path: singleSong.path, type: 'file' });
 
@@ -1068,7 +1110,7 @@ client.on('messageCreate', async message => {
       return;
     }
 
-    // 3. PENCARIAN ONLINE DENGAN BYPASS BOT & AUTO-FALLBACK
+    // 3. PENCARIAN ONLINE
     const searchMsg = await message.reply(`🔍 Mencari lagu **"${query}"**...`);
     const onlineTrack = await searchOnlineTrack(query);
 
@@ -1079,7 +1121,12 @@ client.on('messageCreate', async message => {
       );
     }
 
-    await connectVoice(message, voiceChannel);
+    try {
+      await connectVoice(message, voiceChannel);
+    } catch (err) {
+      return searchMsg.edit(`❌ ${err.message}`);
+    }
+
     const wasEmpty = mgr.musicQueue.length === 0 && !mgr.currentTrack;
     mgr.musicQueue.push(onlineTrack);
 
@@ -1094,7 +1141,8 @@ client.on('messageCreate', async message => {
   }
 
   if (message.content === '!queue') {
-    if (!mgr.currentTrack && mgr.musicQueue.length === 0) return message.reply('📭 Antrean musik saat ini kosong.');
+    const mgr = guildManagers.get(guildId);
+    if (!mgr || (!mgr.currentTrack && mgr.musicQueue.length === 0)) return message.reply('📭 Antrean musik saat ini kosong.');
 
     let text = `🎶 **Sedang Diputar:** \`${mgr.currentTrack ? mgr.currentTrack.title : 'Tidak ada'}\`\n\n📋 **Daftar Antrean Lengkap:**\n`;
     if (mgr.musicQueue.length === 0) {
@@ -1109,7 +1157,7 @@ client.on('messageCreate', async message => {
   }
 
   if (message.content === '!setup-verify') {
-    if (!message.member?.permissions.has('Administrator')) return message.reply('❌ Khusus Admin.');
+    if (!message.member?.permissions.has(PermissionFlagsBits.Administrator)) return message.reply('❌ Khusus Admin.');
     const embed = new EmbedBuilder()
       .setTitle('🛡️ Verifikasi Member')
       .setDescription('Selamat datang!\nKlik tombol **Verifikasi** di bawah untuk membuka akses channel.\n*Syarat: Umur akun minimal 30 hari.*')
@@ -1150,8 +1198,7 @@ client.on('messageCreate', async message => {
   }
 
   if (message.content.startsWith('!seek')) {
-    const targetStr = message.content.split(' ')[1];
-    const targetSec = parseTimeToSeconds(targetStr);
+    const targetSec = parseTimeToSeconds(message.content.split(' ')[1]);
     if (targetSec === null) {
       return message.reply('⚠️ Format waktu tidak valid! Gunakan format `mm:ss` (contoh: `!seek 1:30` atau `!seek 45`).');
     }
@@ -1163,17 +1210,14 @@ client.on('messageCreate', async message => {
   }
 
   if (message.content === '!dc' || message.content === '!leave') {
-    stopProgressTicker(guildId);
-    mgr.musicQueue = [];
-    mgr.currentTrack = null;
-    mgr.player.stop();
-    const conn = getVoiceConnection(guildId);
-    if (conn) conn.destroy();
-    if (mgr.lastPlayerMessage) {
+    const mgr = guildManagers.get(guildId);
+    if (mgr?.lastPlayerMessage) {
       mgr.lastPlayerMessage.delete().catch(() => {});
       mgr.lastPlayerMessage = null;
     }
-    guildManagers.delete(guildId);
+    destroyGuildManager(guildId);
+    const conn = getVoiceConnection(guildId);
+    if (conn) conn.destroy();
     return message.reply('👋 Berhasil keluar dari voice channel dan mereset player.');
   }
 
@@ -1186,7 +1230,6 @@ client.on('messageCreate', async message => {
 client.on('interactionCreate', async interaction => {
   if (!interaction.isButton()) return;
   const guildId = interaction.guildId;
-  const mgr = getGuildManager(guildId);
 
   // Verifikasi Member Baru
   if (interaction.customId === 'btn_verify') {
@@ -1207,17 +1250,17 @@ client.on('interactionCreate', async interaction => {
         content: `✅ Akun kamu berusia **${Math.floor(accountAgeDays)} hari**. Verifikasi berhasil! Role **${verifiedRole.name}** telah diberikan.`,
         flags: MessageFlags.Ephemeral
       });
-    } else {
-      return interaction.reply({
-        content: `✅ Umur akun valid (**${Math.floor(accountAgeDays)} hari**). Role "Verified" / "Member" belum dibuat di server ini oleh Admin.`,
-        flags: MessageFlags.Ephemeral
-      });
     }
+    return interaction.reply({
+      content: `✅ Umur akun valid (**${Math.floor(accountAgeDays)} hari**). Role "Verified" / "Member" belum dibuat di server ini oleh Admin.`,
+      flags: MessageFlags.Ephemeral
+    });
   }
 
   // Tombol Player Controller
   if (interaction.customId.startsWith('btn_player_')) {
-    if (!mgr.currentTrack) {
+    const mgr = guildManagers.get(guildId);
+    if (!mgr || !mgr.currentTrack) {
       return interaction.reply({ content: '⚠️ Tidak ada lagu yang sedang diputar saat ini.', flags: MessageFlags.Ephemeral });
     }
 
@@ -1226,20 +1269,14 @@ client.on('interactionCreate', async interaction => {
         mgr.player.pause();
         mgr.currentTrack.pausedAt = Date.now();
         stopProgressTicker(guildId);
-
-        const embed = buildPlayerEmbed(mgr, mgr.currentTrack, true);
-        const rows = buildPlayerButtons(mgr, true);
-        await interaction.update({ embeds: [embed], components: rows });
+        await interaction.update({ embeds: [buildPlayerEmbed(mgr, mgr.currentTrack, true)], components: buildPlayerButtons(mgr, true) });
       } else if (mgr.player.state.status === AudioPlayerStatus.Paused) {
         if (mgr.currentTrack.pausedAt) {
           mgr.currentTrack.startedAt += (Date.now() - mgr.currentTrack.pausedAt);
           mgr.currentTrack.pausedAt = null;
         }
         mgr.player.unpause();
-
-        const embed = buildPlayerEmbed(mgr, mgr.currentTrack, false);
-        const rows = buildPlayerButtons(mgr, false);
-        await interaction.update({ embeds: [embed], components: rows });
+        await interaction.update({ embeds: [buildPlayerEmbed(mgr, mgr.currentTrack, false)], components: buildPlayerButtons(mgr, false) });
         startProgressTicker(guildId);
       } else {
         await interaction.reply({ content: '⚠️ Status player tidak dapat diubah.', flags: MessageFlags.Ephemeral });
@@ -1247,18 +1284,17 @@ client.on('interactionCreate', async interaction => {
       return;
     }
 
-    if (interaction.customId === 'btn_player_rewind10') {
+    if (interaction.customId === 'btn_player_rewind10' || interaction.customId === 'btn_player_forward10') {
+      const isForward = interaction.customId === 'btn_player_forward10';
       const current = getCurrentPlaybackSeconds(mgr);
-      const target = Math.max(0, current - 10);
+      const target = isForward ? current + 10 : Math.max(0, current - 10);
+      // Balas dulu (batas waktu interaksi 3 detik), seek bisa lebih lama
+      await interaction.reply({
+        content: `${isForward ? '⏩ Maju' : '⏪ Mundur'} 10 detik (sekarang: **${formatTime(target)}**).`,
+        flags: MessageFlags.Ephemeral
+      });
       await executeSeek(guildId, target);
-      return interaction.reply({ content: `⏪ Mundur 10 detik (sekarang: **${formatTime(target)}**).`, flags: MessageFlags.Ephemeral });
-    }
-
-    if (interaction.customId === 'btn_player_forward10') {
-      const current = getCurrentPlaybackSeconds(mgr);
-      const target = current + 10;
-      await executeSeek(guildId, target);
-      return interaction.reply({ content: `⏩ Maju 10 detik (sekarang: **${formatTime(target)}**).`, flags: MessageFlags.Ephemeral });
+      return;
     }
 
     if (interaction.customId === 'btn_player_skip') {
@@ -1267,31 +1303,21 @@ client.on('interactionCreate', async interaction => {
       return;
     }
 
+    // FIX: sebelumnya update() lalu reply() -> error "already acknowledged"
     if (interaction.customId === 'btn_player_shuffle') {
       shuffleArray(mgr.musicQueue);
-      if (mgr.currentTrack) {
-        const embed = buildPlayerEmbed(mgr, mgr.currentTrack, false);
-        const rows = buildPlayerButtons(mgr, false);
-        await interaction.update({ embeds: [embed], components: rows });
-      }
-      return interaction.reply({ content: '🔀 **Antrean di server ini berhasil diacak!**', flags: MessageFlags.Ephemeral });
+      await interaction.update({ embeds: [buildPlayerEmbed(mgr, mgr.currentTrack, false)], components: buildPlayerButtons(mgr, false) });
+      return interaction.followUp({ content: '🔀 **Antrean di server ini berhasil diacak!**', flags: MessageFlags.Ephemeral });
     }
 
     if (interaction.customId === 'btn_player_loop') {
       mgr.isLoopQueue = !mgr.isLoopQueue;
-      if (mgr.currentTrack) {
-        const embed = buildPlayerEmbed(mgr, mgr.currentTrack, false);
-        const rows = buildPlayerButtons(mgr, false);
-        await interaction.update({ embeds: [embed], components: rows });
-      }
-      return interaction.reply({ content: `🔁 Mode Loop di server ini: **${mgr.isLoopQueue ? 'AKTIF' : 'NONAKTIF'}**`, flags: MessageFlags.Ephemeral });
+      await interaction.update({ embeds: [buildPlayerEmbed(mgr, mgr.currentTrack, false)], components: buildPlayerButtons(mgr, false) });
+      return interaction.followUp({ content: `🔁 Mode Loop di server ini: **${mgr.isLoopQueue ? 'AKTIF' : 'NONAKTIF'}**`, flags: MessageFlags.Ephemeral });
     }
 
     if (interaction.customId === 'btn_player_stop') {
-      stopProgressTicker(guildId);
-      mgr.musicQueue = [];
-      mgr.currentTrack = null;
-      mgr.player.stop();
+      destroyGuildManager(guildId);
       const conn = getVoiceConnection(guildId);
       if (conn) conn.destroy();
 
@@ -1301,8 +1327,6 @@ client.on('interactionCreate', async interaction => {
         .setDescription(`Musik dihentikan oleh **${interaction.user.username}**.`);
 
       await interaction.update({ embeds: [stoppedEmbed], components: [] });
-      mgr.lastPlayerMessage = null;
-      guildManagers.delete(guildId);
       return;
     }
   }

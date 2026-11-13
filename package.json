@@ -1,13 +1,13 @@
 {
   "name": "discord-music-bot",
   "version": "1.0.0",
-  "description": "Discord Music, Attendance and Verification Bot",
   "main": "app.js",
   "scripts": {
     "start": "node --max-http-header-size=65536 app.js"
   },
   "dependencies": {
-    "@discordjs/voice": "^0.19.2",
+    "@discordjs/voice": "^0.18.0",
+    "@distube/ytdl-core": "^5.2.1",
     "@snazzah/davey": "^0.1.12",
     "discord.js": "^14.16.3",
     "dotenv": "^16.4.5",

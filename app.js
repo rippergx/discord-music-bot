@@ -37,7 +37,7 @@ const {
   StreamType
 } = require('@discordjs/voice');
 
-// Helper untuk konversi Cookie (Mendukung Header String & Format JSON dari Cookie-Editor)
+// Helper untuk konversi Cookie (Mendukung Header String & Format JSON)
 function parseCookieString(raw) {
   if (!raw) return '';
   raw = raw.trim();
@@ -173,7 +173,7 @@ const client = new Client({
   ]
 });
 
-// --- 5. ENGINE PENCARIAN MUSIK ONLINE (YOUTUBE COOKIE AUTH + RATE-LIMIT SAFE) ---
+// --- 5. ENGINE PENCARIAN MUSIK ONLINE (MULTI-LAYER SMART FALLBACK) ---
 async function searchOnlineTrack(query) {
   await ensureSoundCloud();
   await ensureYouTubeCookie();
@@ -189,13 +189,21 @@ async function searchOnlineTrack(query) {
     }
   } catch (err) {}
 
-  // 1. JIKA YOUTUBE COOKIE AKTIF, PRIORITASKAN YOUTUBE (100% BEBAS BLOKIR)
+  // JALUR 1: COBA YOUTUBE DENGAN BERBAGAI VARIAN KUALITAS
   if (ytCookieInitialized) {
     try {
       const searchRes = await yts(query);
       if (searchRes && searchRes.videos && searchRes.videos.length > 0) {
         const v = searchRes.videos[0];
-        const stream = await play.stream(v.url);
+        let stream = null;
+        try {
+          stream = await play.stream(v.url, { quality: 0, discordPlayerCompatibility: true });
+        } catch (e1) {
+          try {
+            stream = await play.stream(v.url, { quality: 1 });
+          } catch (e2) {}
+        }
+
         if (stream && stream.stream) {
           return {
             title: v.title,
@@ -209,67 +217,37 @@ async function searchOnlineTrack(query) {
       }
     } catch (ytErr) {
       console.warn('[YouTube Cookie Stream Warning]:', ytErr.message);
-      if (ytErr.message && ytErr.message.includes('429')) {
-        return { error: 'RATE_LIMIT', message: 'YouTube membatasi request sementara (429 Too Many Requests).' };
-      }
     }
   }
 
-  // 2. COBA SOUNDCLOUD (MAKSIMAL 3 HASIL SAJA AGAR AMAN DARI 429 RATE-LIMIT)
-  try {
-    const scResults = await play.search(query, { limit: 3, source: { soundcloud: 'tracks' } });
-    if (scResults && scResults.length > 0) {
-      for (const t of scResults) {
-        try {
-          const testStream = await play.stream_from_info(t);
-          if (testStream && testStream.stream) {
-            const durationSec = t.durationInSec || (t.durationInMs ? Math.floor(t.durationInMs / 1000) : 0);
-            return {
-              title: t.name || t.title,
-              url: t.url,
-              duration: durationSec,
-              type: 'online',
-              sourceName: 'SoundCloud',
-              cachedStream: testStream
-            };
+  // JALUR 2: SOUNDCLOUD SMART SEARCH (AUTO-FALLBACK KE COVER / AUDIO JIKA GO+ 404)
+  const soundCloudKeywords = [query, `${query} cover`, `${query} acoustic`, `${query} audio`];
+  for (const scQuery of soundCloudKeywords) {
+    try {
+      const scResults = await play.search(scQuery, { limit: 3, source: { soundcloud: 'tracks' } });
+      if (scResults && scResults.length > 0) {
+        for (const t of scResults) {
+          try {
+            const testStream = await play.stream_from_info(t);
+            if (testStream && testStream.stream) {
+              const durationSec = t.durationInSec || (t.durationInMs ? Math.floor(t.durationInMs / 1000) : 0);
+              return {
+                title: t.name || t.title,
+                url: t.url,
+                duration: durationSec,
+                type: 'online',
+                sourceName: scQuery === query ? 'SoundCloud' : 'SoundCloud (Cover/Acoustic)',
+                cachedStream: testStream
+              };
+            }
+          } catch (scStreamErr) {
+            // Lanjut ke hasil berikutnya jika track Go+ (404)
           }
-        } catch (scStreamErr) {
-          // Lewati track jika Go+ / 404
         }
       }
+    } catch (scErr) {
+      console.warn('[SoundCloud Search Warning]:', scErr.message);
     }
-  } catch (scErr) {
-    console.warn('[SoundCloud Search Warning]:', scErr.message);
-  }
-
-  // 3. COBA YOUTUBE REGULER (JIKA COOKIE BELUM AKTIF)
-  try {
-    const searchRes = await yts(query);
-    if (searchRes && searchRes.videos && searchRes.videos.length > 0) {
-      const v = searchRes.videos[0];
-      try {
-        const stream = await play.stream(v.url);
-        if (stream && stream.stream) {
-          return {
-            title: v.title,
-            url: v.url,
-            duration: v.seconds || 0,
-            type: 'online',
-            sourceName: 'YouTube',
-            cachedStream: stream
-          };
-        }
-      } catch (ytStreamErr) {
-        if (ytStreamErr.message && ytStreamErr.message.includes('Sign in to confirm')) {
-          return { error: 'BOT_BLOCKED', title: v.title };
-        }
-        if (ytStreamErr.message && ytStreamErr.message.includes('429')) {
-          return { error: 'RATE_LIMIT', message: 'YouTube membatasi request sementara (429 Too Many Requests).' };
-        }
-      }
-    }
-  } catch (err) {
-    console.warn('YouTube fallback warning:', err.message);
   }
 
   return null;
@@ -975,23 +953,7 @@ client.on('messageCreate', async message => {
     const onlineTrack = await searchOnlineTrack(query);
 
     if (!onlineTrack) {
-      return searchMsg.edit(`❌ Tidak ditemukan lagu yang dapat diputar untuk **"${query}"**.\n💡 *Coba judul yang lebih spesifik atau putar lagu lokal dari folder \`Music\`!*`);
-    }
-
-    if (onlineTrack.error === 'RATE_LIMIT') {
-      return searchMsg.edit(
-        `⏳ **Layanan Streaming Sedang Sibuk (Error 429 Too Many Requests):**\n` +
-        `Server streaming membatasi frekuensi pencarian sementara. Tunggu 1 menit lalu coba lagi, atau putar lagu lokal dari folder \`Music\`!`
-      );
-    }
-
-    if (onlineTrack.error === 'BOT_BLOCKED') {
-      return searchMsg.edit(
-        `🛡️ **YouTube Meminta Autentikasi Akun (Anti-Bot Datacenter):**\n` +
-        `Lagu ditemukan (**${onlineTrack.title}**), namun YouTube memblokir IP cloud server Railway dengan status: *"Sign in to confirm you're not a bot"*.\n\n` +
-        `🔑 **Solusi:**\n` +
-        `Variable \`YOUTUBE_COOKIE\` sudah kakak masukkan di Railway! Cukup buka tab **Deployments** di Railway lalu klik **Redeploy** agar variabel tersebut langsung aktif! 🚀`
-      );
+      return searchMsg.edit(`❌ Tidak ditemukan lagu yang dapat diputar untuk **"${query}"**.\n💡 *Coba ketik \`!play ${query} cover\` atau putar lagu lokal dari folder \`Music\`!*`);
     }
 
     connectVoice(message, voiceChannel);

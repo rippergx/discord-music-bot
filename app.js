@@ -28,17 +28,30 @@ const {
   StreamType
 } = require('@discordjs/voice');
 
-// Inisialisasi SoundCloud Client Token di awal
-play.getFreeClientID().then(clientID => {
-  play.setToken({
-    soundcloud: {
-      client_id: clientID
+// --- 1. INISIALISASI TOKEN SOUNDCLOUD (ANTI-BLOKIR SERVER) ---
+let scInitialized = false;
+async function ensureSoundCloud() {
+  if (scInitialized) return true;
+  try {
+    const clientID = await play.getFreeClientID();
+    if (clientID) {
+      await play.setToken({
+        soundcloud: {
+          client_id: clientID
+        }
+      });
+      scInitialized = true;
+      console.log('✅ Token SoundCloud aktif (Bebas Blokir Datacenter).');
+      return true;
     }
-  });
-  console.log('✅ SoundCloud Client ID siap digunakan.');
-}).catch(() => {});
+  } catch (err) {
+    console.warn('⚠️ Gagal memuat token SoundCloud:', err.message);
+  }
+  return false;
+}
+ensureSoundCloud();
 
-// --- 1. WEB SERVER UNTUK HEALTHCHECK RAILWAY ---
+// --- 2. WEB SERVER UNTUK HEALTHCHECK RAILWAY ---
 const PORT = process.env.PORT || 8080;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -47,7 +60,7 @@ http.createServer((req, res) => {
   console.log(`🚀 Web server running on port ${PORT}`);
 });
 
-// --- 2. DATABASE ABSENSI PERSISTEN (attendance.json) ---
+// --- 3. DATABASE ABSENSI PERSISTEN (attendance.json) ---
 const ATTENDANCE_FILE = path.join(__dirname, 'attendance.json');
 
 function loadAttendance() {
@@ -91,7 +104,7 @@ function getWIBTime(dateObj = new Date()) {
   return { dateKey, dateFormatted, timeFormatted };
 }
 
-// --- 3. DISCORD CLIENT ---
+// --- 4. DISCORD CLIENT ---
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -102,8 +115,11 @@ const client = new Client({
   ]
 });
 
-// --- 4. ENGINE PENCARIAN MUSIK (YOUTUBE / SPOTIFY / SOUNDCLOUD) ---
+// --- 5. ENGINE PENCARIAN MUSIK ONLINE ---
 async function searchOnlineTrack(query) {
+  // Pastikan token SoundCloud sudah siap
+  await ensureSoundCloud();
+
   // Cek jika input adalah link Spotify
   try {
     const spCheck = await play.validate(query);
@@ -115,7 +131,25 @@ async function searchOnlineTrack(query) {
     }
   } catch (err) {}
 
-  // 1. Pencarian Cepat & Super Stabil via yt-search
+  // 1. CARI DI SOUNDCLOUD TERLEBIH DAHULU (Bebas Blokir & Cepat)
+  try {
+    const scResults = await play.search(query, { limit: 1, source: { soundcloud: 'tracks' } });
+    if (scResults && scResults.length > 0) {
+      const t = scResults[0];
+      const durationSec = t.durationInSec || (t.durationInMs ? Math.floor(t.durationInMs / 1000) : 0);
+      return {
+        title: t.name || t.title,
+        url: t.url,
+        duration: durationSec,
+        type: 'online',
+        sourceName: 'SoundCloud'
+      };
+    }
+  } catch (err) {
+    console.warn('SoundCloud search warning:', err.message);
+  }
+
+  // 2. JIKA DI SOUNDCLOUD TIDAK ADA, COBA DI YOUTUBE
   try {
     const searchRes = await yts(query);
     if (searchRes && searchRes.videos && searchRes.videos.length > 0) {
@@ -129,24 +163,7 @@ async function searchOnlineTrack(query) {
       };
     }
   } catch (err) {
-    console.warn('yt-search warning:', err.message);
-  }
-
-  // 2. Fallback SoundCloud jika YouTube tidak merespon
-  try {
-    const scResults = await play.search(query, { limit: 1, source: { soundcloud: 'tracks' } });
-    if (scResults && scResults.length > 0) {
-      const t = scResults[0];
-      return {
-        title: t.name || t.title,
-        url: t.url,
-        duration: t.durationInSec || Math.floor((t.durationInMs || 0) / 1000),
-        type: 'online',
-        sourceName: 'SoundCloud'
-      };
-    }
-  } catch (err) {
-    console.warn('SoundCloud search warning:', err.message);
+    console.warn('YouTube search warning:', err.message);
   }
 
   return null;
@@ -190,7 +207,7 @@ function createProgressBar(currentSec, totalSec, barSize = 16) {
   return bar;
 }
 
-// --- 5. SISTEM MULTI-SERVER MUSIC PLAYER ---
+// --- 6. SISTEM MULTI-SERVER MUSIC PLAYER ---
 const guildManagers = new Map();
 
 function getGuildManager(guildId) {
@@ -509,6 +526,37 @@ async function playNextSong(guildId) {
       startProgressTicker(guildId);
     } catch (err) {
       console.error(`[Server ${guildId}] Error streaming online track:`, err.message);
+
+      // Auto-fallback: Jika YouTube terblokir bot-check, langsung ganti dengan versi SoundCloud
+      if (err.message && err.message.includes('confirm you’re not a bot')) {
+        await ensureSoundCloud();
+        try {
+          const scResults = await play.search(mgr.currentTrack.title, { limit: 1, source: { soundcloud: 'tracks' } });
+          if (scResults && scResults.length > 0) {
+            const scTrack = scResults[0];
+            const scStream = await play.stream(scTrack.url);
+            mgr.currentTrack = {
+              title: scTrack.name || scTrack.title,
+              url: scTrack.url,
+              duration: scTrack.durationInSec || 0,
+              type: 'online',
+              sourceName: 'SoundCloud'
+            };
+            const resource = createAudioResource(scStream.stream, {
+              inputType: scStream.type,
+              inlineVolume: true
+            });
+            if (resource.volume) resource.volume.setVolume(0.8);
+            mgr.player.play(resource);
+            await sendPlayerCard(guildId, mgr.currentTrack, false);
+            startProgressTicker(guildId);
+            return;
+          }
+        } catch (scErr) {
+          console.error('Fallback ke SoundCloud gagal:', scErr.message);
+        }
+      }
+
       if (mgr.activeTextChannel) {
         mgr.activeTextChannel.send(`⚠️ Gagal memutar **${mgr.currentTrack.title}**, lanjut lagu berikutnya...`);
       }
@@ -548,7 +596,7 @@ function connectVoice(message, voiceChannel) {
   return connection;
 }
 
-// --- 6. EVENT LISTENERS DISCORD ---
+// --- 7. EVENT LISTENERS DISCORD ---
 client.once('ready', () => {
   console.log(`✅ [LOGIN SUKSES] Logged in as ${client.user.tag}!`);
   console.log(`📡 Multi-Server aktif di ${client.guilds.cache.size} server.`);
@@ -557,7 +605,7 @@ client.once('ready', () => {
 client.on('error', err => console.error('❌ Discord Client Error:', err));
 client.on('warn', warn => console.warn('⚠️ Discord Client Warning:', warn));
 
-// --- 7. COMMAND HANDLER ---
+// --- 8. COMMAND HANDLER ---
 client.on('messageCreate', async message => {
   if (message.author.bot || !message.guild) return;
   const guildId = message.guild.id;
@@ -700,9 +748,9 @@ client.on('messageCreate', async message => {
 
   if (message.content === '!help') {
     return message.reply(`🎧 **Panduan Perintah Bot:**\n\n` +
-      `🔍 **PENCARIAN MUSIK ONLINE (YOUTUBE / SPOTIFY):**\n` +
+      `🔍 **PENCARIAN MUSIK ONLINE (YOUTUBE / SPOTIFY / SOUNDCLOUD):**\n` +
       `• \`!play <judul lagu>\` : Cari & putar lagu langsung (contoh: \`!play sial mahalini\`)\n` +
-      `• \`!play <link>\` : Putar dari link YouTube / Spotify / SoundCloud\n\n` +
+      `• \`!play <link>\` : Putar dari link Spotify / SoundCloud / YouTube\n\n` +
       `📻 **RADIO LIVE 24/7:**\n` +
       `• \`!radio\` : Lihat daftar channel radio\n` +
       `• \`!radio lofi\` : Putar Lofi Beats 24/7\n\n` +
@@ -816,12 +864,12 @@ client.on('messageCreate', async message => {
       return;
     }
 
-    // 3. PENCARIAN ONLINE OTOMATIS (YOUTUBE / SPOTIFY / SOUNDCLOUD)
-    const searchMsg = await message.reply(`🔍 Mencari lagu **"${query}"** di YouTube & Spotify...`);
+    // 3. PENCARIAN ONLINE (SOUNDCLOUD / YOUTUBE)
+    const searchMsg = await message.reply(`🔍 Mencari lagu **"${query}"**...`);
     const onlineTrack = await searchOnlineTrack(query);
 
     if (!onlineTrack) {
-      return searchMsg.edit(`❌ Tidak ditemukan lagu untuk pencarian: **"${query}"**.`);
+      return searchMsg.edit(`❌ Tidak ditemukan lagu online untuk **"${query}"**.`);
     }
 
     connectVoice(message, voiceChannel);
@@ -869,7 +917,7 @@ client.on('messageCreate', async message => {
   }
 });
 
-// --- 8. INTERAKSI TOMBOL ---
+// --- 9. INTERAKSI TOMBOL ---
 client.on('interactionCreate', async interaction => {
   if (!interaction.isButton()) return;
   const guildId = interaction.guild?.id;
@@ -996,7 +1044,7 @@ client.on('interactionCreate', async interaction => {
   }
 });
 
-// --- 9. LOGIN BOT ---
+// --- 10. LOGIN BOT ---
 console.log('🤖 Menghubungkan bot ke Discord...');
 client.login(process.env.DISCORD_TOKEN).catch(err => {
   console.error('❌ GAGAL LOGIN KE DISCORD! Periksa DISCORD_TOKEN atau Privileged Intents:', err.message);

@@ -115,9 +115,8 @@ const client = new Client({
   ]
 });
 
-// --- 5. ENGINE PENCARIAN MUSIK ONLINE ---
+// --- 5. ENGINE PENCARIAN MUSIK ONLINE (DENGAN AUTO-FILTER GO+ 404) ---
 async function searchOnlineTrack(query) {
-  // Pastikan token SoundCloud sudah siap
   await ensureSoundCloud();
 
   // Cek jika input adalah link Spotify
@@ -131,25 +130,35 @@ async function searchOnlineTrack(query) {
     }
   } catch (err) {}
 
-  // 1. CARI DI SOUNDCLOUD TERLEBIH DAHULU (Bebas Blokir & Cepat)
+  // 1. CARI DI SOUNDCLOUD: FILTER OTOMATIS MELEWATI HASIL GO+ (404)
   try {
-    const scResults = await play.search(query, { limit: 1, source: { soundcloud: 'tracks' } });
+    const scResults = await play.search(query, { limit: 8, source: { soundcloud: 'tracks' } });
     if (scResults && scResults.length > 0) {
-      const t = scResults[0];
-      const durationSec = t.durationInSec || (t.durationInMs ? Math.floor(t.durationInMs / 1000) : 0);
-      return {
-        title: t.name || t.title,
-        url: t.url,
-        duration: durationSec,
-        type: 'online',
-        sourceName: 'SoundCloud'
-      };
+      for (const t of scResults) {
+        try {
+          // Uji apakah track ini bisa di-stream (bukan Go+ DRM)
+          const testStream = await play.stream(t.url);
+          if (testStream && testStream.stream) {
+            const durationSec = t.durationInSec || (t.durationInMs ? Math.floor(t.durationInMs / 1000) : 0);
+            return {
+              title: t.name || t.title,
+              url: t.url,
+              duration: durationSec,
+              type: 'online',
+              sourceName: 'SoundCloud',
+              cachedStream: testStream // Kunci stream yang sudah terbukti valid!
+            };
+          }
+        } catch (streamErr) {
+          console.log(`[SoundCloud] Melewati track berbayar (Go+ 404): "${t.name || t.title}"`);
+        }
+      }
     }
   } catch (err) {
     console.warn('SoundCloud search warning:', err.message);
   }
 
-  // 2. JIKA DI SOUNDCLOUD TIDAK ADA, COBA DI YOUTUBE
+  // 2. JIKA SEMUA TRACK SOUNDCLOUD GO+, FALLBACK KE YOUTUBE
   try {
     const searchRes = await yts(query);
     if (searchRes && searchRes.videos && searchRes.videos.length > 0) {
@@ -515,9 +524,15 @@ async function playNextSong(guildId) {
     startProgressTicker(guildId);
   } else if (mgr.currentTrack.type === 'online') {
     try {
-      const stream = await play.stream(mgr.currentTrack.url);
-      const resource = createAudioResource(stream.stream, {
-        inputType: stream.type,
+      // Gunakan stream yang sudah diverifikasi saat pencarian
+      let streamData = mgr.currentTrack.cachedStream;
+      if (!streamData) {
+        streamData = await play.stream(mgr.currentTrack.url);
+      }
+      mgr.currentTrack.cachedStream = null;
+
+      const resource = createAudioResource(streamData.stream, {
+        inputType: streamData.type,
         inlineVolume: true
       });
       if (resource.volume) resource.volume.setVolume(0.8);
@@ -526,37 +541,6 @@ async function playNextSong(guildId) {
       startProgressTicker(guildId);
     } catch (err) {
       console.error(`[Server ${guildId}] Error streaming online track:`, err.message);
-
-      // Auto-fallback: Jika YouTube terblokir bot-check, langsung ganti dengan versi SoundCloud
-      if (err.message && err.message.includes('confirm you’re not a bot')) {
-        await ensureSoundCloud();
-        try {
-          const scResults = await play.search(mgr.currentTrack.title, { limit: 1, source: { soundcloud: 'tracks' } });
-          if (scResults && scResults.length > 0) {
-            const scTrack = scResults[0];
-            const scStream = await play.stream(scTrack.url);
-            mgr.currentTrack = {
-              title: scTrack.name || scTrack.title,
-              url: scTrack.url,
-              duration: scTrack.durationInSec || 0,
-              type: 'online',
-              sourceName: 'SoundCloud'
-            };
-            const resource = createAudioResource(scStream.stream, {
-              inputType: scStream.type,
-              inlineVolume: true
-            });
-            if (resource.volume) resource.volume.setVolume(0.8);
-            mgr.player.play(resource);
-            await sendPlayerCard(guildId, mgr.currentTrack, false);
-            startProgressTicker(guildId);
-            return;
-          }
-        } catch (scErr) {
-          console.error('Fallback ke SoundCloud gagal:', scErr.message);
-        }
-      }
-
       if (mgr.activeTextChannel) {
         mgr.activeTextChannel.send(`⚠️ Gagal memutar **${mgr.currentTrack.title}**, lanjut lagu berikutnya...`);
       }
@@ -597,9 +581,12 @@ function connectVoice(message, voiceChannel) {
 }
 
 // --- 7. EVENT LISTENERS DISCORD ---
-client.once('ready', () => {
+client.once('clientReady', () => {
   console.log(`✅ [LOGIN SUKSES] Logged in as ${client.user.tag}!`);
   console.log(`📡 Multi-Server aktif di ${client.guilds.cache.size} server.`);
+});
+client.once('ready', () => {
+  console.log(`✅ [LOGIN SUKSES] Logged in as ${client.user.tag}!`);
 });
 
 client.on('error', err => console.error('❌ Discord Client Error:', err));
@@ -864,12 +851,12 @@ client.on('messageCreate', async message => {
       return;
     }
 
-    // 3. PENCARIAN ONLINE (SOUNDCLOUD / YOUTUBE)
+    // 3. PENCARIAN ONLINE DENGAN AUTO-FILTER GO+ (404)
     const searchMsg = await message.reply(`🔍 Mencari lagu **"${query}"**...`);
     const onlineTrack = await searchOnlineTrack(query);
 
     if (!onlineTrack) {
-      return searchMsg.edit(`❌ Tidak ditemukan lagu online untuk **"${query}"**.`);
+      return searchMsg.edit(`❌ Tidak ditemukan versi lagu yang dapat diputar untuk **"${query}"**.`);
     }
 
     connectVoice(message, voiceChannel);

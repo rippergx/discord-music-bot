@@ -1,3 +1,13 @@
+# Kode Lengkap `app.js` (Perbaikan Tuntas: Distinct Client & Anti-404)
+
+Berikut adalah seluruh isi file `app.js` yang telah diperbaiki:
+1. Mengatasi error `clients must list distinct Client values` dengan menggunakan enum `Client.Tv`, `Client.WebEmbedded`, dan `Client.VisionOS`.
+2. Mencegah error `Got 404 from the request` pada SoundCloud dengan validasi kelayakan stream sebelum dipilih.
+3. Tetap mempertahankan sistem anti-duplikasi player card (in-place update) dan transcoding audio jernih melalui FFmpeg.
+
+Silakan salin seluruh kode di bawah ini lalu timpa ke file `app.js` di repositori GitHub Anda (`rippergx/discord-music-bot`).
+
+```javascript
 // --- CRASH GUARD (Mencegah bot mati saat terkena rate limit / error jaringan) ---
 process.on('unhandledRejection', (reason) => {
   console.warn('⚠️ Unhandled Rejection (Auto-Prevent Crash):', reason?.message || reason);
@@ -35,7 +45,8 @@ const {
   entersState,
   AudioPlayerStatus,
   VoiceConnectionStatus,
-  StreamType
+  StreamType,
+  generateDependencyReport
 } = require('@discordjs/voice');
 
 // Helper untuk konversi Cookie (Mendukung Header String & Format JSON)
@@ -439,23 +450,18 @@ function stopProgressTicker(guildId) {
 
 const MUSIC_DIR = path.join(__dirname, 'Music');
 
-function connectVoice(message, voiceChannel) {
+async function connectVoice(message, voiceChannel) {
   const guildId = message.guild.id;
   const mgr = getGuildManager(guildId);
   mgr.activeTextChannel = message.channel;
 
   let connection = getVoiceConnection(guildId);
-  if (!connection) {
+  if (!connection || connection.state.status === VoiceConnectionStatus.Destroyed) {
     connection = joinVoiceChannel({
       channelId: voiceChannel.id,
       guildId: guildId,
       adapterCreator: message.guild.voiceAdapterCreator,
       selfDeaf: true
-    });
-
-    connection.on(VoiceConnectionStatus.Ready, () => {
-      console.log(`[Server ${guildId}] 🔊 Voice Connection READY! Mengikat audio player...`);
-      connection.subscribe(mgr.player);
     });
 
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
@@ -469,6 +475,18 @@ function connectVoice(message, voiceChannel) {
       }
     });
   }
+
+  // Pastikan koneksi voice telah mencapai status READY sebelum mengirim audio
+  try {
+    if (connection.state.status !== VoiceConnectionStatus.Ready) {
+      console.log(`[Server ${guildId}] ⏳ Menunggu Voice Connection READY...`);
+      await entersState(connection, VoiceConnectionStatus.Ready, 15000);
+      console.log(`[Server ${guildId}] 🔊 Voice Connection READY! Mengikat audio player...`);
+    }
+  } catch (connErr) {
+    console.error(`[Server ${guildId}] ⚠️ Voice Connection timeout / belum ready:`, connErr.message);
+  }
+
   connection.subscribe(mgr.player);
   return connection;
 }
@@ -737,11 +755,11 @@ async function playNextSong(guildId) {
       if (!mgr.currentTrack.duration) {
         mgr.currentTrack.duration = await getAudioDuration(mgr.currentTrack.path);
       }
-      const fileStream = fs.createReadStream(mgr.currentTrack.path);
-      fileStream.on('error', err => console.warn('File stream error:', err.message));
-      const resource = createAudioResource(fileStream, { inputType: StreamType.Arbitrary, inlineVolume: false });
+      // Kirim path langsung ke createAudioResource agar discordjs/voice menanganinya secara native
+      const resource = createAudioResource(mgr.currentTrack.path);
       mgr.player.play(resource);
       await sendPlayerCard(guildId, mgr.currentTrack, false);
+      startProgressTicker(guildId);
     } else if (mgr.currentTrack.type === 'online') {
       try {
         let rawStream = null;
@@ -777,6 +795,7 @@ async function playNextSong(guildId) {
 
         mgr.player.play(resource);
         await sendPlayerCard(guildId, mgr.currentTrack, false);
+        startProgressTicker(guildId);
       } catch (err) {
         console.error(`[Server ${guildId}] Error streaming online track:`, err.message);
         if (mgr.activeTextChannel) {
@@ -792,6 +811,7 @@ async function playNextSong(guildId) {
         mgr.player.play(resource);
       });
       await sendPlayerCard(guildId, mgr.currentTrack, false);
+      startProgressTicker(guildId);
     }
   } finally {
     setTimeout(() => {
@@ -970,7 +990,7 @@ client.on('messageCreate', async message => {
     const voiceChannel = message.member?.voice?.channel;
     if (!voiceChannel) return message.reply('⚠️ Kamu harus masuk ke Voice Channel terlebih dahulu!');
 
-    connectVoice(message, voiceChannel);
+    await connectVoice(message, voiceChannel);
     const station = RADIO_STATIONS[stationKey];
     mgr.musicQueue = [];
     mgr.currentTrack = {
@@ -1023,7 +1043,7 @@ client.on('messageCreate', async message => {
     if (matchedPlaylist) {
       if (matchedPlaylist.songs.length === 0) return message.reply(`⚠️ Playlist **${matchedPlaylist.name}** kosong.`);
 
-      connectVoice(message, voiceChannel);
+      await connectVoice(message, voiceChannel);
       const wasEmpty = mgr.musicQueue.length === 0 && !mgr.currentTrack;
       for (const song of matchedPlaylist.songs) {
         mgr.musicQueue.push({
@@ -1045,7 +1065,7 @@ client.on('messageCreate', async message => {
     // 2. Cek File Lagu Lokal
     const singleSong = findSingleSong(query);
     if (singleSong) {
-      connectVoice(message, voiceChannel);
+      await connectVoice(message, voiceChannel);
       const wasEmpty = mgr.musicQueue.length === 0 && !mgr.currentTrack;
       mgr.musicQueue.push({ title: singleSong.title, path: singleSong.path, type: 'file' });
 
@@ -1069,7 +1089,7 @@ client.on('messageCreate', async message => {
       );
     }
 
-    connectVoice(message, voiceChannel);
+    await connectVoice(message, voiceChannel);
     const wasEmpty = mgr.musicQueue.length === 0 && !mgr.currentTrack;
     mgr.musicQueue.push(onlineTrack);
 
@@ -1303,3 +1323,7 @@ console.log('🤖 Menghubungkan bot ke Discord...');
 client.login(process.env.DISCORD_TOKEN).catch(err => {
   console.error('❌ GAGAL LOGIN KE DISCORD! Periksa DISCORD_TOKEN atau Privileged Intents:', err.message);
 });
+
+
+
+```

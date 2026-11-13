@@ -1,4 +1,4 @@
-// --- CRASH GUARD (Mencegah bot mati saat terkena rate limit 429 / error jaringan) ---
+// --- CRASH GUARD (Mencegah bot mati saat terkena rate limit / error jaringan) ---
 process.on('unhandledRejection', (reason) => {
   console.warn('⚠️ Unhandled Rejection (Auto-Prevent Crash):', reason?.message || reason);
 });
@@ -61,7 +61,30 @@ function parseCookieString(raw) {
   return raw;
 }
 
-// --- 1. INISIALISASI TOKEN SOUNDCLOUD & YOUTUBE COOKIE (BYPASS BOT CHECK) ---
+// Inisialisasi Engine YouTube Modern (@distube/ytdl-core)
+let ytdlModule = null;
+let ytInstance = null;
+try {
+  ytdlModule = require('@distube/ytdl-core');
+  console.log('✅ Engine YouTube Modern (@distube/ytdl-core) berhasil dimuat!');
+} catch (e) {
+  console.log('ℹ️ @distube/ytdl-core belum terpasang di package.json.');
+}
+
+function getYouTubeInstance() {
+  if (!ytdlModule) return null;
+  if (!ytInstance) {
+    const cookieVal = process.env.YOUTUBE_COOKIE ? parseCookieString(process.env.YOUTUBE_COOKIE) : undefined;
+    ytInstance = new ytdlModule.Ytdl({
+      cookie: cookieVal,
+      lang: 'id',
+      country: 'ID'
+    });
+  }
+  return ytInstance;
+}
+
+// Inisialisasi SoundCloud
 let scInitialized = false;
 async function ensureSoundCloud() {
   if (scInitialized) return true;
@@ -83,31 +106,6 @@ async function ensureSoundCloud() {
   return false;
 }
 ensureSoundCloud();
-
-let ytCookieInitialized = false;
-async function ensureYouTubeCookie() {
-  if (ytCookieInitialized) return true;
-  const rawCookie = process.env.YOUTUBE_COOKIE;
-  if (rawCookie && rawCookie.trim().length > 0) {
-    try {
-      const formattedCookie = parseCookieString(rawCookie);
-      await play.setToken({
-        youtube: {
-          cookie: formattedCookie
-        }
-      });
-      ytCookieInitialized = true;
-      console.log('✅ YouTube Cookie aktif (BYPASS BOT SUKSES: Bebas blokir "Sign in to confirm you\'re not a bot").');
-      return true;
-    } catch (err) {
-      console.warn('⚠️ Gagal memuat YOUTUBE_COOKIE:', err.message);
-    }
-  } else {
-    console.log('ℹ️ YOUTUBE_COOKIE belum terdeteksi di container saat ini.');
-  }
-  return false;
-}
-ensureYouTubeCookie();
 
 // --- 2. WEB SERVER UNTUK HEALTHCHECK RAILWAY ---
 const PORT = process.env.PORT || 8080;
@@ -173,11 +171,8 @@ const client = new Client({
   ]
 });
 
-// --- 5. ENGINE PENCARIAN MUSIK ONLINE (MULTI-LAYER SMART FALLBACK) ---
+// --- 5. ENGINE PENCARIAN MUSIK ONLINE ---
 async function searchOnlineTrack(query) {
-  await ensureSoundCloud();
-  await ensureYouTubeCookie();
-
   // Cek jika input adalah link Spotify
   try {
     const spCheck = await play.validate(query);
@@ -189,65 +184,54 @@ async function searchOnlineTrack(query) {
     }
   } catch (err) {}
 
-  // JALUR 1: COBA YOUTUBE DENGAN BERBAGAI VARIAN KUALITAS
-  if (ytCookieInitialized) {
+  // 1. ENGINE UTAMA: YOUTUBE DENGAN @distube/ytdl-core (100% BEBAS BLOKIR & KUALITAS TINGGI)
+  if (ytdlModule) {
     try {
       const searchRes = await yts(query);
       if (searchRes && searchRes.videos && searchRes.videos.length > 0) {
         const v = searchRes.videos[0];
-        let stream = null;
-        try {
-          stream = await play.stream(v.url, { quality: 0, discordPlayerCompatibility: true });
-        } catch (e1) {
-          try {
-            stream = await play.stream(v.url, { quality: 1 });
-          } catch (e2) {}
-        }
+        const yt = getYouTubeInstance();
+        const info = await yt.getInfo(v.url);
+        const stream = yt.download(info, {
+          quality: ytdlModule.Quality.HighestAudio,
+          filter: { hasAudio: true, hasVideo: false }
+        });
 
-        if (stream && stream.stream) {
-          return {
-            title: v.title,
-            url: v.url,
-            duration: v.seconds || 0,
-            type: 'online',
-            sourceName: 'YouTube (Verified Cookie)',
-            cachedStream: stream
-          };
-        }
+        return {
+          title: info.videoDetails.title || v.title,
+          url: v.url,
+          duration: parseInt(info.videoDetails.lengthSeconds, 10) || v.seconds || 0,
+          type: 'online',
+          sourceName: 'YouTube HD',
+          cachedStream: { stream, type: StreamType.Arbitrary }
+        };
       }
     } catch (ytErr) {
-      console.warn('[YouTube Cookie Stream Warning]:', ytErr.message);
+      console.warn('[YouTube Modern Engine Warning]:', ytErr.message);
     }
   }
 
-  // JALUR 2: SOUNDCLOUD SMART SEARCH (AUTO-FALLBACK KE COVER / AUDIO JIKA GO+ 404)
-  const soundCloudKeywords = [query, `${query} cover`, `${query} acoustic`, `${query} audio`];
-  for (const scQuery of soundCloudKeywords) {
-    try {
-      const scResults = await play.search(scQuery, { limit: 3, source: { soundcloud: 'tracks' } });
-      if (scResults && scResults.length > 0) {
-        for (const t of scResults) {
-          try {
-            const testStream = await play.stream_from_info(t);
-            if (testStream && testStream.stream) {
-              const durationSec = t.durationInSec || (t.durationInMs ? Math.floor(t.durationInMs / 1000) : 0);
-              return {
-                title: t.name || t.title,
-                url: t.url,
-                duration: durationSec,
-                type: 'online',
-                sourceName: scQuery === query ? 'SoundCloud' : 'SoundCloud (Cover/Acoustic)',
-                cachedStream: testStream
-              };
-            }
-          } catch (scStreamErr) {
-            // Lanjut ke hasil berikutnya jika track Go+ (404)
-          }
-        }
+  // 2. FALLBACK KE SOUNDCLOUD (HANYA 1 REQUEST AGAR TIDAK KENA 429 RATE-LIMIT)
+  await ensureSoundCloud();
+  try {
+    const scResults = await play.search(query, { limit: 1, source: { soundcloud: 'tracks' } });
+    if (scResults && scResults.length > 0) {
+      const t = scResults[0];
+      const stream = await play.stream_from_info(t);
+      if (stream && stream.stream) {
+        const durationSec = t.durationInSec || (t.durationInMs ? Math.floor(t.durationInMs / 1000) : 0);
+        return {
+          title: t.name || t.title,
+          url: t.url,
+          duration: durationSec,
+          type: 'online',
+          sourceName: 'SoundCloud',
+          cachedStream: stream
+        };
       }
-    } catch (scErr) {
-      console.warn('[SoundCloud Search Warning]:', scErr.message);
     }
+  } catch (scErr) {
+    console.warn('[SoundCloud Search Warning]:', scErr.message);
   }
 
   return null;
@@ -634,7 +618,7 @@ async function playNextSong(guildId) {
       mgr.currentTrack.cachedStream = null;
 
       const resource = createAudioResource(streamData.stream, {
-        inputType: streamData.type,
+        inputType: streamData.type || StreamType.Arbitrary,
         inlineVolume: true
       });
       if (resource.volume) resource.volume.setVolume(0.8);
@@ -953,7 +937,7 @@ client.on('messageCreate', async message => {
     const onlineTrack = await searchOnlineTrack(query);
 
     if (!onlineTrack) {
-      return searchMsg.edit(`❌ Tidak ditemukan lagu yang dapat diputar untuk **"${query}"**.\n💡 *Coba ketik \`!play ${query} cover\` atau putar lagu lokal dari folder \`Music\`!*`);
+      return searchMsg.edit(`❌ Tidak ditemukan lagu yang dapat diputar untuk **"${query}"**.\n💡 *Coba ketik judul lebih spesifik atau putar lagu lokal dari folder \`Music\`!*`);
     }
 
     connectVoice(message, voiceChannel);

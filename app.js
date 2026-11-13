@@ -14,7 +14,8 @@ const http = require('http');
 const https = require('https');
 const path = require('path');
 const fs = require('fs');
-const { execFile } = require('child_process');
+const os = require('os');
+const { execFile, spawn } = require('child_process');
 const prism = require('prism-media');
 const play = require('play-dl');
 const yts = require('yt-search');
@@ -120,7 +121,7 @@ async function getYouTubeInfo(url) {
     return await ytdl.getInfo(url);
   } catch (e) {
     console.warn('[YouTube Anonymous Info Warning]:', e.message);
-    return null;
+    throw e;
   }
 }
 
@@ -134,6 +135,157 @@ function createYouTubeStream(url) {
     dlChunkSize: 0,
     ...(agent ? { agent } : {})
   });
+}
+
+// ==========================================================
+// ENGINE UTAMA: yt-dlp (paling aktif di-update, tahan perubahan YouTube)
+// Binary standalone diunduh otomatis dari rilis resmi GitHub yt-dlp ke folder ./bin
+// Bisa di-override dengan env YTDLP_PATH jika yt-dlp sudah terpasang di sistem.
+// ==========================================================
+const BIN_DIR = path.join(__dirname, 'bin');
+const YTDLP_ASSET =
+  process.platform === 'win32' ? 'yt-dlp.exe'
+  : process.platform === 'darwin' ? 'yt-dlp_macos'
+  : process.arch === 'arm64' ? 'yt-dlp_linux_aarch64'
+  : 'yt-dlp_linux';
+const YTDLP_BIN = process.env.YTDLP_PATH || path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+const YTDLP_SOURCE = 'YouTube (yt-dlp)';
+
+function downloadFile(url, dest, redirects = 0) {
+  return new Promise((resolve, reject) => {
+    if (redirects > 10) return reject(new Error('Terlalu banyak redirect'));
+    https.get(url, { headers: { 'User-Agent': 'discord-music-bot' } }, res => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        return resolve(downloadFile(new URL(res.headers.location, url).toString(), dest, redirects + 1));
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      const tmp = dest + '.part';
+      const out = fs.createWriteStream(tmp);
+      res.pipe(out);
+      out.on('finish', () => out.close(() => {
+        fs.renameSync(tmp, dest);
+        resolve();
+      }));
+      out.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
+let ytdlpReady = null;
+function ensureYtDlp() {
+  if (!ytdlpReady) {
+    ytdlpReady = (async () => {
+      if (!fs.existsSync(YTDLP_BIN)) {
+        if (process.env.YTDLP_PATH) throw new Error(`YTDLP_PATH tidak ditemukan: ${YTDLP_BIN}`);
+        fs.mkdirSync(BIN_DIR, { recursive: true });
+        console.log(`⬇️ Mengunduh yt-dlp (${YTDLP_ASSET})...`);
+        await downloadFile(`https://github.com/yt-dlp/yt-dlp/releases/latest/download/${YTDLP_ASSET}`, YTDLP_BIN);
+        if (process.platform !== 'win32') fs.chmodSync(YTDLP_BIN, 0o755);
+      }
+      const version = await new Promise((resolve, reject) => {
+        execFile(YTDLP_BIN, ['--version'], { timeout: 30000 }, (err, stdout) => (err ? reject(err) : resolve(stdout.trim())));
+      });
+      console.log(`✅ yt-dlp siap (versi ${version}).`);
+      return true;
+    })().catch(err => {
+      console.warn('⚠️ Gagal menyiapkan yt-dlp:', err.message);
+      ytdlpReady = null; // coba lagi di permintaan berikutnya
+      return false;
+    });
+  }
+  return ytdlpReady;
+}
+ensureYtDlp();
+
+// Konversi YOUTUBE_COOKIE -> file cookie format Netscape untuk yt-dlp
+let ytDlpCookieFile; // undefined = belum dibuat, null = tidak ada cookie
+function getYtDlpCookieFile() {
+  if (ytDlpCookieFile !== undefined) return ytDlpCookieFile;
+  const cookies = parseCookieArray(process.env.YOUTUBE_COOKIE);
+  if (!cookies.length) return (ytDlpCookieFile = null);
+  const defaultExp = Math.floor(Date.now() / 1000) + 365 * 24 * 3600;
+  const lines = ['# Netscape HTTP Cookie File'];
+  for (const c of cookies) {
+    const domain = c.domain || '.youtube.com';
+    const exp = Number(c.expirationDate ?? c.expires);
+    lines.push([
+      domain,
+      domain.startsWith('.') ? 'TRUE' : 'FALSE',
+      c.path || '/',
+      c.secure === false ? 'FALSE' : 'TRUE',
+      Number.isFinite(exp) && exp > 0 ? Math.floor(exp) : defaultExp,
+      c.name,
+      c.value
+    ].join('\t'));
+  }
+  const file = path.join(os.tmpdir(), 'yt-cookies.txt');
+  fs.writeFileSync(file, lines.join('\n') + '\n', 'utf8');
+  console.log(`🍪 yt-dlp memakai ${cookies.length} cookie YouTube.`);
+  return (ytDlpCookieFile = file);
+}
+
+function ytDlpBaseArgs() {
+  // yt-dlp butuh JS runtime untuk memecahkan proteksi YouTube; pakai Node yang sedang menjalankan bot
+  const args = ['--no-playlist', '--no-warnings', '--js-runtimes', `node:${process.execPath}`];
+  const cookieFile = getYtDlpCookieFile();
+  if (cookieFile) args.push('--cookies', cookieFile);
+  return args;
+}
+
+function lastErrorLine(text) {
+  const lines = String(text || '').trim().split('\n').filter(Boolean);
+  return (lines.filter(l => l.includes('ERROR')).pop() || lines.pop() || '').replace(/^ERROR:\s*/, '').trim();
+}
+
+function runYtDlpJson(args, timeoutMs = 60000) {
+  return new Promise((resolve, reject) => {
+    execFile(YTDLP_BIN, args, { maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(lastErrorLine(stderr) || err.message));
+      try {
+        resolve(JSON.parse(stdout));
+      } catch (e) {
+        reject(new Error('Output yt-dlp tidak valid'));
+      }
+    });
+  });
+}
+
+async function searchYtDlp(query) {
+  const target = /^https?:\/\//i.test(query) ? query : `ytsearch1:${query}`;
+  // -J dengan -f memastikan format audio benar-benar bisa diputar (bukan hanya hasil pencarian)
+  const data = await runYtDlpJson([...ytDlpBaseArgs(), '-f', 'bestaudio/best', '-J', target]);
+  const entry = Array.isArray(data.entries) ? data.entries.find(Boolean) : data;
+  if (!entry) throw new Error('Tidak ada hasil');
+  return {
+    title: entry.title || query,
+    url: entry.webpage_url || entry.original_url || `https://www.youtube.com/watch?v=${entry.id}`,
+    duration: Math.floor(entry.duration || 0),
+    type: 'online',
+    sourceName: YTDLP_SOURCE
+  };
+}
+
+function createYtDlpStream(url) {
+  const proc = spawn(YTDLP_BIN, [...ytDlpBaseArgs(), '-f', 'bestaudio/best', '--quiet', '-o', '-', url], {
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  let errText = '';
+  proc.stderr.on('data', d => {
+    errText = (errText + d).slice(-4000);
+  });
+  proc.on('error', err => console.warn('[yt-dlp] gagal dijalankan:', err.message));
+  proc.on('close', code => {
+    if (code) console.warn(`[yt-dlp] keluar dengan kode ${code}:`, lastErrorLine(errText));
+  });
+  // Saat lagu di-skip/stop, stream ditutup -> matikan proses yt-dlp
+  proc.stdout.on('close', () => {
+    if (proc.exitCode === null) proc.kill();
+  });
+  return proc.stdout;
 }
 
 // Membungkus stream apa pun dengan FFmpeg + seek (-ss), output PCM mentah untuk Discord
@@ -237,7 +389,8 @@ const client = new Client({
 });
 
 // --- 5. ENGINE PENCARIAN MUSIK ONLINE (YOUTUBE + SOUNDCLOUD FALLBACK) ---
-async function searchOnlineTrack(query) {
+// `errors` diisi alasan kegagalan tiap engine agar bisa ditampilkan ke user
+async function searchOnlineTrack(query, errors = []) {
   // Cek jika input adalah link Spotify
   try {
     const spCheck = await play.validate(query);
@@ -245,11 +398,23 @@ async function searchOnlineTrack(query) {
       if (play.is_expired()) await play.refreshToken();
       const spData = await play.spotify(query);
       const searchTerms = `${spData.name} ${spData.artists.map(a => a.name).join(' ')}`;
-      return await searchOnlineTrack(searchTerms);
+      return await searchOnlineTrack(searchTerms, errors);
     }
   } catch (err) {}
 
-  // 1. ENGINE UTAMA: YOUTUBE
+  // 1. ENGINE UTAMA: yt-dlp
+  if (await ensureYtDlp()) {
+    try {
+      return await searchYtDlp(query);
+    } catch (e) {
+      console.warn('[yt-dlp Search Warning]:', e.message);
+      errors.push(`yt-dlp: ${e.message}`);
+    }
+  } else {
+    errors.push('yt-dlp: binary gagal diunduh/dijalankan (lihat log)');
+  }
+
+  // 2. CADANGAN: @distube/ytdl-core
   if (ytdl) {
     try {
       let videoUrl = null;
@@ -280,17 +445,27 @@ async function searchOnlineTrack(query) {
           };
         }
       }
+      errors.push('ytdl-core: video tidak ditemukan');
     } catch (ytErr) {
       console.warn('[YouTube Engine Warning]:', ytErr.message);
+      errors.push(`ytdl-core: ${ytErr.message}`);
     }
   }
 
-  // 2. FALLBACK KE SOUNDCLOUD (validasi stream agar tidak terkena Go+ 404)
-  await ensureSoundCloud();
+  // 3. FALLBACK KE SOUNDCLOUD (validasi stream agar tidak terkena Go+ 404)
+  if (!(await ensureSoundCloud())) {
+    errors.push('SoundCloud: gagal mendapatkan client ID');
+    return null;
+  }
   try {
     const scResults = await play.search(query, { limit: 5, source: { soundcloud: 'tracks' } });
+    if (!scResults || scResults.length === 0) errors.push('SoundCloud: tidak ada hasil');
+    let lastScError = null;
     for (const t of scResults || []) {
-      const testStream = await play.stream(t.url).catch(() => null);
+      const testStream = await play.stream(t.url).catch(e => {
+        lastScError = e;
+        return null;
+      });
       if (!testStream || !testStream.stream) continue;
       // Tutup stream tes; stream baru dibuat saat lagu benar-benar diputar
       testStream.stream.destroy?.();
@@ -304,8 +479,14 @@ async function searchOnlineTrack(query) {
         sourceName: 'SoundCloud'
       };
     }
+    if (scResults && scResults.length > 0) {
+      const reason = lastScError ? lastScError.message : 'stream kosong';
+      console.warn(`[SoundCloud Stream Warning]: ${scResults.length} hasil tidak bisa di-stream:`, reason);
+      errors.push(`SoundCloud: ${scResults.length} hasil tidak bisa di-stream (${reason})`);
+    }
   } catch (scErr) {
     console.warn('[SoundCloud Search Warning]:', scErr.message);
+    errors.push(`SoundCloud: ${scErr.message}`);
   }
 
   return null;
@@ -388,7 +569,7 @@ function getGuildManager(guildId) {
       if (mgr.destroyed || mgr.isHandlingError) return;
       mgr.isHandlingError = true;
 
-      if (mgr.currentTrack && mgr.currentTrack.sourceName === 'YouTube HD') {
+      if (mgr.currentTrack && String(mgr.currentTrack.sourceName).startsWith('YouTube')) {
         console.log(`[Server ${guildId}] 🔄 YouTube stream drop, mencoba fallback ke SoundCloud...`);
         try {
           await ensureSoundCloud();
@@ -671,7 +852,9 @@ async function executeSeek(guildId, targetSeconds) {
       mgr.player.play(createAudioResource(ffmpeg, { inputType: StreamType.Raw }));
     } else if (mgr.currentTrack.type === 'online') {
       let source;
-      if (mgr.currentTrack.sourceName === 'YouTube HD' && ytdl) {
+      if (mgr.currentTrack.sourceName === YTDLP_SOURCE) {
+        source = createYtDlpStream(mgr.currentTrack.url);
+      } else if (mgr.currentTrack.sourceName === 'YouTube HD' && ytdl) {
         source = createYouTubeStream(mgr.currentTrack.url);
       } else {
         await ensureSoundCloud();
@@ -819,7 +1002,11 @@ async function playNextSong(guildId) {
         mgr.player.play(createAudioResource(fileStream, { inputType: StreamType.Arbitrary }));
       } else if (mgr.currentTrack.type === 'online') {
         let resource;
-        if (mgr.currentTrack.sourceName === 'YouTube HD' && ytdl) {
+        if (mgr.currentTrack.sourceName === YTDLP_SOURCE) {
+          const dlpStream = createYtDlpStream(mgr.currentTrack.url);
+          dlpStream.on('error', err => console.warn(`[Server ${guildId}] yt-dlp stream warning:`, err.message));
+          resource = createAudioResource(dlpStream, { inputType: StreamType.Arbitrary });
+        } else if (mgr.currentTrack.sourceName === 'YouTube HD' && ytdl) {
           const ytStream = createYouTubeStream(mgr.currentTrack.url);
           ytStream.on('error', err => console.warn(`[Server ${guildId}] YouTube stream warning:`, err.message));
           resource = createAudioResource(ytStream, { inputType: StreamType.Arbitrary });
@@ -1118,11 +1305,14 @@ client.on('messageCreate', async message => {
 
     // 3. PENCARIAN ONLINE
     const searchMsg = await message.reply(`🔍 Mencari lagu **"${query}"**...`);
-    const onlineTrack = await searchOnlineTrack(query);
+    const searchErrors = [];
+    const onlineTrack = await searchOnlineTrack(query, searchErrors);
 
     if (!onlineTrack) {
+      const reasons = searchErrors.map(e => `• ${e.slice(0, 180)}`).join('\n').slice(0, 1500);
       return searchMsg.edit(
         `❌ Tidak ditemukan lagu yang dapat diputar untuk **"${query}"**.\n` +
+        (reasons ? `\`\`\`\n${reasons}\n\`\`\`` : '') +
         `💡 *Tips: Perbarui YOUTUBE_COOKIE di Railway menggunakan jendela Incognito (tanpa klik logout).*`
       );
     }

@@ -353,9 +353,31 @@ function getGuildManager(guildId) {
       playNextSong(guildId);
     });
 
-    newPlayer.on('error', error => {
+    newPlayer.on('error', async error => {
       console.error(`[Server ${guildId}] ❌ Audio Error:`, error.message);
       stopProgressTicker(guildId);
+
+      // Jika terjadi stream drop pada YouTube, otomatis fallback ke SoundCloud
+      if (mgr.currentTrack && mgr.currentTrack.sourceName === 'YouTube HD') {
+        console.log(`[Server ${guildId}] 🔄 YouTube stream drop, mencoba fallback otomatis ke SoundCloud...`);
+        try {
+          const scResult = await play.search(mgr.currentTrack.title, { limit: 3, source: { soundcloud: 'tracks' } });
+          for (const t of scResult) {
+            try {
+              const scStream = await play.stream_from_info(t);
+              if (scStream && scStream.stream) {
+                mgr.currentTrack.sourceName = 'SoundCloud';
+                const { stream: probedStream, type } = await demuxProbe(scStream.stream);
+                const resource = createAudioResource(probedStream, { inputType: type });
+                mgr.player.play(resource);
+                startProgressTicker(guildId);
+                return;
+              }
+            } catch (e) {}
+          }
+        } catch (scErr) {}
+      }
+
       playNextSong(guildId);
     });
 
@@ -536,7 +558,8 @@ async function executeSeek(guildId, targetSeconds) {
           quality: ytdlModule.Quality.HighestAudio,
           filter: { hasAudio: true, hasVideo: false },
           begin: `${Math.floor(targetSeconds)}s`,
-          highWaterMark: 1 << 25
+          highWaterMark: 1 << 25,
+          dlChunkSize: 0
         });
 
         try {
@@ -702,7 +725,8 @@ async function playNextSong(guildId) {
         rawStream = yt.download(mgr.currentTrack.url, {
           quality: ytdlModule.Quality.HighestAudio,
           filter: { hasAudio: true, hasVideo: false },
-          highWaterMark: 1 << 25
+          highWaterMark: 1 << 25,
+          dlChunkSize: 0
         });
       } else {
         const scData = await play.stream(mgr.currentTrack.url);

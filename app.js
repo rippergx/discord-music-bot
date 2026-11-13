@@ -1,3 +1,11 @@
+// --- CRASH GUARD (Mencegah bot mati saat terkena rate limit 429 / error jaringan) ---
+process.on('unhandledRejection', (reason) => {
+  console.warn('⚠️ Unhandled Rejection (Auto-Prevent Crash):', reason?.message || reason);
+});
+process.on('uncaughtException', (err) => {
+  console.warn('⚠️ Uncaught Exception (Auto-Prevent Crash):', err?.message || err);
+});
+
 const ffmpegPath = require('ffmpeg-static');
 process.env.FFMPEG_PATH = ffmpegPath;
 
@@ -29,6 +37,30 @@ const {
   StreamType
 } = require('@discordjs/voice');
 
+// Helper untuk konversi Cookie (Mendukung Header String & Format JSON dari Cookie-Editor)
+function parseCookieString(raw) {
+  if (!raw) return '';
+  raw = raw.trim();
+  if (raw.startsWith('[') || raw.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .filter(c => c && c.name && c.value)
+          .map(c => `${c.name}=${c.value}`)
+          .join('; ');
+      } else if (typeof parsed === 'object') {
+        return Object.entries(parsed)
+          .map(([k, v]) => `${k}=${v}`)
+          .join('; ');
+      }
+    } catch (e) {
+      console.warn('⚠️ Gagal parse JSON cookie, menggunakan raw string.');
+    }
+  }
+  return raw;
+}
+
 // --- 1. INISIALISASI TOKEN SOUNDCLOUD & YOUTUBE COOKIE (BYPASS BOT CHECK) ---
 let scInitialized = false;
 async function ensureSoundCloud() {
@@ -55,11 +87,13 @@ ensureSoundCloud();
 let ytCookieInitialized = false;
 async function ensureYouTubeCookie() {
   if (ytCookieInitialized) return true;
-  if (process.env.YOUTUBE_COOKIE && process.env.YOUTUBE_COOKIE.trim().length > 0) {
+  const rawCookie = process.env.YOUTUBE_COOKIE;
+  if (rawCookie && rawCookie.trim().length > 0) {
     try {
+      const formattedCookie = parseCookieString(rawCookie);
       await play.setToken({
         youtube: {
-          cookie: process.env.YOUTUBE_COOKIE.trim()
+          cookie: formattedCookie
         }
       });
       ytCookieInitialized = true;
@@ -69,7 +103,7 @@ async function ensureYouTubeCookie() {
       console.warn('⚠️ Gagal memuat YOUTUBE_COOKIE:', err.message);
     }
   } else {
-    console.log('ℹ️ YOUTUBE_COOKIE belum disetel di Railway Variables.');
+    console.log('ℹ️ YOUTUBE_COOKIE belum terdeteksi di container saat ini.');
   }
   return false;
 }
@@ -139,7 +173,7 @@ const client = new Client({
   ]
 });
 
-// --- 5. ENGINE PENCARIAN MUSIK ONLINE (YOUTUBE COOKIE AUTH + SOUNDCLOUD SMART FILTER) ---
+// --- 5. ENGINE PENCARIAN MUSIK ONLINE (YOUTUBE COOKIE AUTH + RATE-LIMIT SAFE) ---
 async function searchOnlineTrack(query) {
   await ensureSoundCloud();
   await ensureYouTubeCookie();
@@ -155,92 +189,87 @@ async function searchOnlineTrack(query) {
     }
   } catch (err) {}
 
-  // JALUR 1: JIKA YOUTUBE COOKIE AKTIF, PRIORITASKAN YOUTUBE (100% LENGKAP & KUALITAS TINGGI)
-  if (process.env.YOUTUBE_COOKIE && process.env.YOUTUBE_COOKIE.trim().length > 0) {
+  // 1. JIKA YOUTUBE COOKIE AKTIF, PRIORITASKAN YOUTUBE (100% BEBAS BLOKIR)
+  if (ytCookieInitialized) {
     try {
       const searchRes = await yts(query);
       if (searchRes && searchRes.videos && searchRes.videos.length > 0) {
-        for (const v of searchRes.videos.slice(0, 3)) {
-          try {
-            const stream = await play.stream(v.url);
-            if (stream && stream.stream) {
-              return {
-                title: v.title,
-                url: v.url,
-                duration: v.seconds || 0,
-                type: 'online',
-                sourceName: 'YouTube (Verified Cookie)',
-                cachedStream: stream
-              };
-            }
-          } catch (ytStreamErr) {
-            console.warn(`[YouTube] Gagal stream "${v.title}":`, ytStreamErr.message);
-          }
+        const v = searchRes.videos[0];
+        const stream = await play.stream(v.url);
+        if (stream && stream.stream) {
+          return {
+            title: v.title,
+            url: v.url,
+            duration: v.seconds || 0,
+            type: 'online',
+            sourceName: 'YouTube (Verified Cookie)',
+            cachedStream: stream
+          };
         }
       }
     } catch (ytErr) {
-      console.warn('YouTube search error:', ytErr.message);
+      console.warn('[YouTube Cookie Stream Warning]:', ytErr.message);
+      if (ytErr.message && ytErr.message.includes('429')) {
+        return { error: 'RATE_LIMIT', message: 'YouTube membatasi request sementara (429 Too Many Requests).' };
+      }
     }
   }
 
-  // JALUR 2: SOUNDCLOUD DENGAN SMART FILTER (STREAM-FROM-INFO)
-  const scQueries = [query, `${query} audio`, `${query} cover`];
-  for (const q of scQueries) {
-    try {
-      const scResults = await play.search(q, { limit: 5, source: { soundcloud: 'tracks' } });
-      if (scResults && scResults.length > 0) {
-        for (const t of scResults) {
-          try {
-            const testStream = await play.stream_from_info(t);
-            if (testStream && testStream.stream) {
-              const durationSec = t.durationInSec || (t.durationInMs ? Math.floor(t.durationInMs / 1000) : 0);
-              return {
-                title: t.name || t.title,
-                url: t.url,
-                duration: durationSec,
-                type: 'online',
-                sourceName: 'SoundCloud',
-                cachedStream: testStream
-              };
-            }
-          } catch (scErr) {
-            // Track Go+ / DRM 404, lanjut periksa hasil berikutnya
+  // 2. COBA SOUNDCLOUD (MAKSIMAL 3 HASIL SAJA AGAR AMAN DARI 429 RATE-LIMIT)
+  try {
+    const scResults = await play.search(query, { limit: 3, source: { soundcloud: 'tracks' } });
+    if (scResults && scResults.length > 0) {
+      for (const t of scResults) {
+        try {
+          const testStream = await play.stream_from_info(t);
+          if (testStream && testStream.stream) {
+            const durationSec = t.durationInSec || (t.durationInMs ? Math.floor(t.durationInMs / 1000) : 0);
+            return {
+              title: t.name || t.title,
+              url: t.url,
+              duration: durationSec,
+              type: 'online',
+              sourceName: 'SoundCloud',
+              cachedStream: testStream
+            };
           }
+        } catch (scStreamErr) {
+          // Lewati track jika Go+ / 404
         }
       }
-    } catch (scSearchErr) {}
+    }
+  } catch (scErr) {
+    console.warn('[SoundCloud Search Warning]:', scErr.message);
   }
 
-  // JALUR 3: COBA YOUTUBE REGULER (JIKA BELUM ADA COOKIE)
+  // 3. COBA YOUTUBE REGULER (JIKA COOKIE BELUM AKTIF)
   try {
     const searchRes = await yts(query);
     if (searchRes && searchRes.videos && searchRes.videos.length > 0) {
-      for (const v of searchRes.videos.slice(0, 2)) {
-        try {
-          const stream = await play.stream(v.url);
-          if (stream && stream.stream) {
-            return {
-              title: v.title,
-              url: v.url,
-              duration: v.seconds || 0,
-              type: 'online',
-              sourceName: 'YouTube',
-              cachedStream: stream
-            };
-          }
-        } catch (ytDirectErr) {
-          if (ytDirectErr.message && ytDirectErr.message.includes('Sign in to confirm')) {
-            console.warn('[YouTube] Terdeteksi bot block ("Sign in to confirm you\'re not a bot"). Perlu YOUTUBE_COOKIE!');
-            return {
-              error: 'BOT_BLOCKED',
-              title: v.title
-            };
-          }
+      const v = searchRes.videos[0];
+      try {
+        const stream = await play.stream(v.url);
+        if (stream && stream.stream) {
+          return {
+            title: v.title,
+            url: v.url,
+            duration: v.seconds || 0,
+            type: 'online',
+            sourceName: 'YouTube',
+            cachedStream: stream
+          };
+        }
+      } catch (ytStreamErr) {
+        if (ytStreamErr.message && ytStreamErr.message.includes('Sign in to confirm')) {
+          return { error: 'BOT_BLOCKED', title: v.title };
+        }
+        if (ytStreamErr.message && ytStreamErr.message.includes('429')) {
+          return { error: 'RATE_LIMIT', message: 'YouTube membatasi request sementara (429 Too Many Requests).' };
         }
       }
     }
   } catch (err) {
-    console.warn('YouTube fallback search warning:', err.message);
+    console.warn('YouTube fallback warning:', err.message);
   }
 
   return null;
@@ -949,16 +978,19 @@ client.on('messageCreate', async message => {
       return searchMsg.edit(`❌ Tidak ditemukan lagu yang dapat diputar untuk **"${query}"**.\n💡 *Coba judul yang lebih spesifik atau putar lagu lokal dari folder \`Music\`!*`);
     }
 
+    if (onlineTrack.error === 'RATE_LIMIT') {
+      return searchMsg.edit(
+        `⏳ **Layanan Streaming Sedang Sibuk (Error 429 Too Many Requests):**\n` +
+        `Server streaming membatasi frekuensi pencarian sementara. Tunggu 1 menit lalu coba lagi, atau putar lagu lokal dari folder \`Music\`!`
+      );
+    }
+
     if (onlineTrack.error === 'BOT_BLOCKED') {
       return searchMsg.edit(
         `🛡️ **YouTube Meminta Autentikasi Akun (Anti-Bot Datacenter):**\n` +
         `Lagu ditemukan (**${onlineTrack.title}**), namun YouTube memblokir IP cloud server Railway dengan status: *"Sign in to confirm you're not a bot"*.\n\n` +
-        `🔑 **Solusi Resmi & 100% Permanen:**\n` +
-        `Tambahkan Cookie YouTube ke Railway Variables:\n` +
-        `1. Install ekstensi browser **Cookie-Editor** di Chrome / Edge.\n` +
-        `2. Buka \`youtube.com\` (pastikan sudah login akun) ➔ Export Cookie string.\n` +
-        `3. Buka Railway ➔ Service bot ➔ Tab **Variables** ➔ Buat variabel: \`YOUTUBE_COOKIE\` = *(paste teks cookie)*.\n` +
-        `4. Bot akan otomatis bypass dan bebas streaming semua lagu YouTube 24/7! 🚀`
+        `🔑 **Solusi:**\n` +
+        `Variable \`YOUTUBE_COOKIE\` sudah kakak masukkan di Railway! Cukup buka tab **Deployments** di Railway lalu klik **Redeploy** agar variabel tersebut langsung aktif! 🚀`
       );
     }
 

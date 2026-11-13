@@ -80,10 +80,16 @@ function parseCookieArray(raw) {
 // yang TIDAK ADA di @distube/ytdl-core, sehingga YouTube selalu gagal diam-diam.
 let ytdl = null;
 try {
-  ytdl = require('@distube/ytdl-core');
+  const ytdlMod = require('@distube/ytdl-core');
+  // v5 berformat ESM: require() mengembalikan namespace, fungsi utamanya ada di .default
+  ytdl = typeof ytdlMod === 'function' ? ytdlMod : ytdlMod.default;
+  if (typeof ytdl !== 'function' || typeof ytdl.getInfo !== 'function') {
+    throw new Error('API @distube/ytdl-core tidak dikenali (pakai versi 4.x)');
+  }
   console.log('✅ Engine YouTube (@distube/ytdl-core) berhasil dimuat!');
 } catch (e) {
-  console.log('ℹ️ @distube/ytdl-core belum terpasang, YouTube dinonaktifkan (fallback SoundCloud).');
+  ytdl = null;
+  console.log('ℹ️ YouTube dinonaktifkan (fallback SoundCloud):', e.message);
 }
 
 let ytAgent = null; // null = belum dibuat, false = tanpa cookie

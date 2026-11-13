@@ -9,6 +9,7 @@ const fs = require('fs');
 const { execFile } = require('child_process');
 const prism = require('prism-media');
 const play = require('play-dl');
+const yts = require('yt-search');
 const {
   Client,
   GatewayIntentBits,
@@ -26,6 +27,16 @@ const {
   VoiceConnectionStatus,
   StreamType
 } = require('@discordjs/voice');
+
+// Inisialisasi SoundCloud Client Token di awal
+play.getFreeClientID().then(clientID => {
+  play.setToken({
+    soundcloud: {
+      client_id: clientID
+    }
+  });
+  console.log('✅ SoundCloud Client ID siap digunakan.');
+}).catch(() => {});
 
 // --- 1. WEB SERVER UNTUK HEALTHCHECK RAILWAY ---
 const PORT = process.env.PORT || 8080;
@@ -91,9 +102,9 @@ const client = new Client({
   ]
 });
 
-// --- 4. ENGINE PENCARIAN MUSIK ONLINE (YOUTUBE / SPOTIFY / SOUNDCLOUD) ---
+// --- 4. ENGINE PENCARIAN MUSIK (YOUTUBE / SPOTIFY / SOUNDCLOUD) ---
 async function searchOnlineTrack(query) {
-  // Cek jika query adalah link Spotify
+  // Cek jika input adalah link Spotify
   try {
     const spCheck = await play.validate(query);
     if (spCheck === 'sp_track') {
@@ -104,24 +115,24 @@ async function searchOnlineTrack(query) {
     }
   } catch (err) {}
 
-  // 1. Coba Cari di YouTube
+  // 1. Pencarian Cepat & Super Stabil via yt-search
   try {
-    const ytResults = await play.search(query, { limit: 1, source: { youtube: 'video' } });
-    if (ytResults && ytResults.length > 0) {
-      const v = ytResults[0];
+    const searchRes = await yts(query);
+    if (searchRes && searchRes.videos && searchRes.videos.length > 0) {
+      const v = searchRes.videos[0];
       return {
         title: v.title,
         url: v.url,
-        duration: v.durationInSec || 0,
+        duration: v.seconds || 0,
         type: 'online',
         sourceName: 'YouTube'
       };
     }
   } catch (err) {
-    console.warn('YouTube search warning:', err.message);
+    console.warn('yt-search warning:', err.message);
   }
 
-  // 2. Fallback Cari di SoundCloud jika YouTube terhalang
+  // 2. Fallback SoundCloud jika YouTube tidak merespon
   try {
     const scResults = await play.search(query, { limit: 1, source: { soundcloud: 'tracks' } });
     if (scResults && scResults.length > 0) {
@@ -810,7 +821,7 @@ client.on('messageCreate', async message => {
     const onlineTrack = await searchOnlineTrack(query);
 
     if (!onlineTrack) {
-      return searchMsg.edit(`❌ Tidak ditemukan lagu online untuk **"${query}"**.`);
+      return searchMsg.edit(`❌ Tidak ditemukan lagu untuk pencarian: **"${query}"**.`);
     }
 
     connectVoice(message, voiceChannel);

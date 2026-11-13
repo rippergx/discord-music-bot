@@ -15,7 +15,9 @@ const https = require('https');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const net = require('net');
 const { execFile, spawn } = require('child_process');
+const { PassThrough } = require('stream');
 const prism = require('prism-media');
 const play = require('play-dl');
 const yts = require('yt-search');
@@ -201,6 +203,150 @@ function ensureYtDlp() {
 }
 ensureYtDlp();
 
+// ==========================================================
+// CLOUDFLARE WARP (PROXY GRATIS)
+// wgcf      -> mendaftar akun WARP gratis & membuat profil WireGuard
+// wireproxy -> menjalankan WireGuard tanpa root sebagai proxy SOCKS5 lokal
+// yt-dlp lalu diarahkan lewat socks5://127.0.0.1:40000 agar YouTube tidak melihat IP Railway.
+// Aktif otomatis. Matikan dengan env USE_WARP=false. Dilewati jika YTDLP_PROXY diisi.
+// ==========================================================
+const WARP_DIR = path.join(BIN_DIR, 'warp');
+const WARP_SOCKS_PORT = parseInt(process.env.WARP_PORT, 10) || 40000;
+const WGCF_VERSION = '2.3.1';
+const WIREPROXY_VERSION = '1.1.3';
+const GO_OS = process.platform === 'win32' ? 'windows' : process.platform; // linux / darwin / windows
+const GO_ARCH = { x64: 'amd64', arm64: 'arm64', ia32: '386' }[process.arch] || process.arch;
+const EXE = process.platform === 'win32' ? '.exe' : '';
+const WGCF_BIN = path.join(WARP_DIR, 'wgcf' + EXE);
+const WIREPROXY_BIN = path.join(WARP_DIR, 'wireproxy' + EXE);
+const WARP_ENABLED = !process.env.YTDLP_PROXY && !/^(0|false|no|off)$/i.test(process.env.USE_WARP || '');
+
+let warpProxyUrl = null;
+let warpReady = null;
+let wireproxyProc = null;
+
+function runCmd(bin, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(bin, args, { timeout: 60000, ...opts }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(lastErrorLine(stderr) || lastErrorLine(stdout) || err.message));
+      resolve(stdout);
+    });
+  });
+}
+
+function waitForPort(port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    const tryConnect = () => {
+      const sock = net.connect(port, '127.0.0.1');
+      sock.once('connect', () => {
+        sock.destroy();
+        resolve();
+      });
+      sock.once('error', () => {
+        sock.destroy();
+        if (Date.now() > deadline) return reject(new Error(`port ${port} tidak terbuka`));
+        setTimeout(tryConnect, 500);
+      });
+    };
+    tryConnect();
+  });
+}
+
+async function startWireproxy(configPath) {
+  const proc = spawn(WIREPROXY_BIN, ['-c', configPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+  wireproxyProc = proc;
+  let logText = '';
+  const collect = d => {
+    logText = (logText + d).slice(-4000);
+  };
+  proc.stdout.on('data', collect);
+  proc.stderr.on('data', collect);
+  proc.on('error', err => console.warn('[WARP] wireproxy gagal dijalankan:', err.message));
+  proc.on('close', code => {
+    if (wireproxyProc !== proc) return;
+    wireproxyProc = null;
+    warpProxyUrl = null;
+    console.warn(`[WARP] wireproxy berhenti (kode ${code}): ${lastErrorLine(logText)}. Restart dalam 10 detik...`);
+    setTimeout(() => {
+      startWireproxy(configPath).catch(e => console.warn('[WARP] Restart gagal:', e.message));
+    }, 10000);
+  });
+
+  await waitForPort(WARP_SOCKS_PORT, 20000);
+  warpProxyUrl = `socks5://127.0.0.1:${WARP_SOCKS_PORT}`;
+}
+
+function ensureWarp() {
+  if (!WARP_ENABLED) return Promise.resolve(false);
+  if (!warpReady) {
+    warpReady = (async () => {
+      fs.mkdirSync(WARP_DIR, { recursive: true });
+
+      if (!fs.existsSync(WGCF_BIN)) {
+        console.log('⬇️ [WARP] Mengunduh wgcf...');
+        await downloadFile(
+          `https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_${GO_OS}_${GO_ARCH}${EXE}`,
+          WGCF_BIN
+        );
+        if (!EXE) fs.chmodSync(WGCF_BIN, 0o755);
+      }
+
+      if (!fs.existsSync(WIREPROXY_BIN)) {
+        console.log('⬇️ [WARP] Mengunduh wireproxy...');
+        const tgz = path.join(WARP_DIR, 'wireproxy.tar.gz');
+        await downloadFile(
+          `https://github.com/windtf/wireproxy/releases/download/v${WIREPROXY_VERSION}/wireproxy_${GO_OS}_${GO_ARCH}.tar.gz`,
+          tgz
+        );
+        await runCmd('tar', ['-xzf', tgz, '-C', WARP_DIR]);
+        fs.unlinkSync(tgz);
+        if (!fs.existsSync(WIREPROXY_BIN)) throw new Error('binary wireproxy tidak ditemukan setelah ekstrak');
+        if (!EXE) fs.chmodSync(WIREPROXY_BIN, 0o755);
+      }
+
+      // Daftar akun WARP gratis (sekali per container) & buat profil WireGuard
+      const accountFile = path.join(WARP_DIR, 'wgcf-account.toml');
+      const profileFile = path.join(WARP_DIR, 'wgcf-profile.conf');
+      if (!fs.existsSync(accountFile)) {
+        console.log('📝 [WARP] Mendaftarkan akun WARP gratis...');
+        await runCmd(WGCF_BIN, ['register', '--accept-tos'], { cwd: WARP_DIR });
+      }
+      if (!fs.existsSync(profileFile)) {
+        await runCmd(WGCF_BIN, ['generate'], { cwd: WARP_DIR });
+      }
+
+      const wireproxyConf = path.join(WARP_DIR, 'wireproxy.conf');
+      fs.writeFileSync(
+        wireproxyConf,
+        `WGConfig = ${profileFile.replace(/\\/g, '/')}\n\n[Socks5]\nBindAddress = 127.0.0.1:${WARP_SOCKS_PORT}\n`,
+        'utf8'
+      );
+
+      await startWireproxy(wireproxyConf);
+      console.log(`✅ [WARP] Cloudflare WARP aktif di ${warpProxyUrl}, yt-dlp memakai IP Cloudflare.`);
+      return true;
+    })().catch(err => {
+      console.warn('⚠️ [WARP] Gagal menyiapkan WARP, yt-dlp memakai koneksi langsung:', err.message);
+      if (wireproxyProc) {
+        const p = wireproxyProc;
+        wireproxyProc = null;
+        p.kill();
+      }
+      setTimeout(() => {
+        warpReady = null; // coba lagi 5 menit kemudian
+      }, 5 * 60 * 1000);
+      return false;
+    });
+  }
+  return warpReady;
+}
+ensureWarp();
+
+process.on('exit', () => {
+  if (wireproxyProc) wireproxyProc.kill();
+});
+
 // Konversi YOUTUBE_COOKIE -> file cookie format Netscape untuk yt-dlp
 let ytDlpCookieFile; // undefined = belum dibuat, null = tidak ada cookie
 function getYtDlpCookieFile() {
@@ -233,6 +379,11 @@ function ytDlpBaseArgs() {
   const args = ['--no-playlist', '--no-warnings', '--js-runtimes', `node:${process.execPath}`];
   const cookieFile = getYtDlpCookieFile();
   if (cookieFile) args.push('--cookies', cookieFile);
+  // Opsional: proxy residensial agar IP server tidak ditandai bot oleh YouTube
+  // contoh: http://user:pass@host:port atau socks5://user:pass@host:port
+  // Jika tidak diisi, otomatis memakai Cloudflare WARP (jika aktif)
+  const proxy = process.env.YTDLP_PROXY || warpProxyUrl;
+  if (proxy) args.push('--proxy', proxy);
   return args;
 }
 
@@ -254,38 +405,91 @@ function runYtDlpJson(args, timeoutMs = 60000) {
   });
 }
 
-async function searchYtDlp(query) {
-  const target = /^https?:\/\//i.test(query) ? query : `ytsearch1:${query}`;
+const YTDLP_SC_SOURCE = 'SoundCloud (yt-dlp)';
+
+// --- Cooldown YouTube ---
+// Saat YouTube menandai IP server sebagai bot, terus-menerus mencoba justru membuat blokir makin lama.
+// Jadi YouTube dijeda sementara dan bot langsung memakai SoundCloud.
+const YT_BLOCK_COOLDOWN_MS = (parseInt(process.env.YT_COOLDOWN_MINUTES, 10) || 15) * 60 * 1000;
+let ytBlockedUntil = 0;
+
+function isYouTubeBlocked() {
+  return Date.now() < ytBlockedUntil;
+}
+
+function markYouTubeBlockedIfNeeded(message) {
+  if (/confirm you.?re not a bot|sign in to confirm|HTTP Error 429|too many requests/i.test(String(message))) {
+    ytBlockedUntil = Date.now() + YT_BLOCK_COOLDOWN_MS;
+    console.warn(`⛔ YouTube mendeteksi bot. YouTube dijeda ${YT_BLOCK_COOLDOWN_MS / 60000} menit, memakai SoundCloud.`);
+    return true;
+  }
+  return false;
+}
+
+function ytBlockedRemainingText() {
+  return `${Math.ceil((ytBlockedUntil - Date.now()) / 60000)} menit`;
+}
+
+function isPreviewOnly(entry) {
+  // Lagu SoundCloud Go+ hanya memberi cuplikan 30 detik
+  const fmt = String(entry.format_id || entry.format || '');
+  return /preview|snipped/i.test(fmt);
+}
+
+async function searchYtDlp(query, { prefix = 'ytsearch1', sourceName = YTDLP_SOURCE } = {}) {
+  const isUrl = /^https?:\/\//i.test(query);
+  const target = isUrl ? query : `${prefix}:${query}`;
   // -J dengan -f memastikan format audio benar-benar bisa diputar (bukan hanya hasil pencarian)
   const data = await runYtDlpJson([...ytDlpBaseArgs(), '-f', 'bestaudio/best', '-J', target]);
-  const entry = Array.isArray(data.entries) ? data.entries.find(Boolean) : data;
+  const entries = Array.isArray(data.entries) ? data.entries.filter(Boolean) : [data];
+  const entry = entries.find(e => !isPreviewOnly(e)) || entries[0];
   if (!entry) throw new Error('Tidak ada hasil');
   return {
     title: entry.title || query,
     url: entry.webpage_url || entry.original_url || `https://www.youtube.com/watch?v=${entry.id}`,
     duration: Math.floor(entry.duration || 0),
     type: 'online',
-    sourceName: YTDLP_SOURCE
+    sourceName
   };
 }
 
-function createYtDlpStream(url) {
+// onFail(pesanError) dipanggil jika yt-dlp gagal SEBELUM mengirim audio sama sekali.
+// Dipanggil sebelum stream ditutup, sehingga event Idle bisa ditahan untuk fallback.
+function createYtDlpStream(url, { onFail } = {}) {
+  const out = new PassThrough({ highWaterMark: 1 << 25 });
   const proc = spawn(YTDLP_BIN, [...ytDlpBaseArgs(), '-f', 'bestaudio/best', '--quiet', '-o', '-', url], {
     stdio: ['ignore', 'pipe', 'pipe']
   });
   let errText = '';
+  let gotData = false;
   proc.stderr.on('data', d => {
     errText = (errText + d).slice(-4000);
   });
-  proc.on('error', err => console.warn('[yt-dlp] gagal dijalankan:', err.message));
+  proc.stdout.once('data', () => {
+    gotData = true;
+  });
+  proc.stdout.pipe(out, { end: false });
+  proc.on('error', err => {
+    errText += `\n${err.message}`;
+    console.warn('[yt-dlp] gagal dijalankan:', err.message);
+  });
   proc.on('close', code => {
-    if (code) console.warn(`[yt-dlp] keluar dengan kode ${code}:`, lastErrorLine(errText));
+    if (code) {
+      const msg = lastErrorLine(errText) || `kode keluar ${code}`;
+      console.warn(`[yt-dlp] keluar dengan kode ${code}:`, msg);
+      if (!gotData && onFail) {
+        try {
+          onFail(msg);
+        } catch (e) {}
+      }
+    }
+    out.end();
   });
   // Saat lagu di-skip/stop, stream ditutup -> matikan proses yt-dlp
-  proc.stdout.on('close', () => {
+  out.on('close', () => {
     if (proc.exitCode === null) proc.kill();
   });
-  return proc.stdout;
+  return out;
 }
 
 // Membungkus stream apa pun dengan FFmpeg + seek (-ss), output PCM mentah untuk Discord
@@ -402,19 +606,45 @@ async function searchOnlineTrack(query, errors = []) {
     }
   } catch (err) {}
 
-  // 1. ENGINE UTAMA: yt-dlp
-  if (await ensureYtDlp()) {
-    try {
-      return await searchYtDlp(query);
-    } catch (e) {
-      console.warn('[yt-dlp Search Warning]:', e.message);
-      errors.push(`yt-dlp: ${e.message}`);
+  const hasYtDlp = await ensureYtDlp();
+  await ensureWarp(); // tunggu WARP siap (jika aktif) agar request pertama sudah lewat proxy
+  if (hasYtDlp) {
+    const isUrl = /^https?:\/\//i.test(query);
+    const isSoundCloudUrl = isUrl && /soundcloud\.com/i.test(query);
+
+    // 1. YouTube via yt-dlp (dilewati jika sedang cooldown)
+    if (!isSoundCloudUrl) {
+      if (isYouTubeBlocked()) {
+        errors.push(`YouTube: dijeda ${ytBlockedRemainingText()} lagi karena terdeteksi bot`);
+      } else {
+        try {
+          return await searchYtDlp(query, { prefix: 'ytsearch1', sourceName: YTDLP_SOURCE });
+        } catch (e) {
+          console.warn('[yt-dlp YouTube Warning]:', e.message);
+          markYouTubeBlockedIfNeeded(e.message);
+          errors.push(`YouTube: ${e.message}`);
+        }
+      }
     }
-  } else {
-    errors.push('yt-dlp: binary gagal diunduh/dijalankan (lihat log)');
+
+    // 2. SoundCloud via yt-dlp (mendukung stream HLS, tidak kena 404 seperti play-dl)
+    if (!isUrl || isSoundCloudUrl) {
+      try {
+        return await searchYtDlp(query, { prefix: 'scsearch3', sourceName: YTDLP_SC_SOURCE });
+      } catch (e) {
+        console.warn('[yt-dlp SoundCloud Warning]:', e.message);
+        errors.push(`SoundCloud: ${e.message}`);
+      }
+    }
+
+    // yt-dlp tersedia: ytdl-core & play-dl tidak dicoba lagi
+    // (keduanya sudah usang dan hanya menambah request yang memperparah blokir)
+    return null;
   }
 
-  // 2. CADANGAN: @distube/ytdl-core
+  errors.push('yt-dlp: binary gagal diunduh/dijalankan (lihat log)');
+
+  // 3. CADANGAN TERAKHIR (hanya jika yt-dlp tidak tersedia): @distube/ytdl-core
   if (ytdl) {
     try {
       let videoUrl = null;
@@ -569,7 +799,7 @@ function getGuildManager(guildId) {
       if (mgr.destroyed || mgr.isHandlingError) return;
       mgr.isHandlingError = true;
 
-      if (mgr.currentTrack && String(mgr.currentTrack.sourceName).startsWith('YouTube')) {
+      if (mgr.currentTrack && mgr.currentTrack.sourceName === 'YouTube HD') {
         console.log(`[Server ${guildId}] 🔄 YouTube stream drop, mencoba fallback ke SoundCloud...`);
         try {
           await ensureSoundCloud();
@@ -852,7 +1082,7 @@ async function executeSeek(guildId, targetSeconds) {
       mgr.player.play(createAudioResource(ffmpeg, { inputType: StreamType.Raw }));
     } else if (mgr.currentTrack.type === 'online') {
       let source;
-      if (mgr.currentTrack.sourceName === YTDLP_SOURCE) {
+      if (mgr.currentTrack.sourceName === YTDLP_SOURCE || mgr.currentTrack.sourceName === YTDLP_SC_SOURCE) {
         source = createYtDlpStream(mgr.currentTrack.url);
       } else if (mgr.currentTrack.sourceName === 'YouTube HD' && ytdl) {
         source = createYouTubeStream(mgr.currentTrack.url);
@@ -1017,6 +1247,53 @@ function schedulePlayerCardRepost(guildId) {
   }, REPOST_DELAY_MS);
 }
 
+// Dipanggil saat yt-dlp gagal memutar lagu yang sudah di antrean
+// (mis. YouTube baru memblokir setelah lagu ditambahkan) -> otomatis pindah ke SoundCloud
+function handleYtDlpPlaybackFail(guildId, track, msg) {
+  const mgr = guildManagers.get(guildId);
+  if (!mgr || mgr.destroyed || mgr.currentTrack !== track) return;
+
+  if (track.sourceName !== YTDLP_SOURCE) {
+    // Sudah SoundCloud dan tetap gagal: biarkan Idle lanjut ke lagu berikutnya
+    mgr.activeTextChannel?.send(`⚠️ Gagal memutar **${track.title}**: ${msg.slice(0, 300)}`).catch(() => {});
+    return;
+  }
+
+  markYouTubeBlockedIfNeeded(msg);
+  mgr.isHandlingError = true; // tahan event Idle selama mencari pengganti
+
+  (async () => {
+    try {
+      const sc = await searchYtDlp(track.title, { prefix: 'scsearch3', sourceName: YTDLP_SC_SOURCE });
+      if (mgr.destroyed || mgr.currentTrack !== track) {
+        mgr.isHandlingError = false;
+        return;
+      }
+      Object.assign(track, {
+        title: sc.title,
+        url: sc.url,
+        duration: sc.duration,
+        sourceName: sc.sourceName,
+        startedAt: Date.now(),
+        pausedAt: null,
+        seekOffset: 0
+      });
+      const scStream = createYtDlpStream(track.url, {
+        onFail: m => handleYtDlpPlaybackFail(guildId, track, m)
+      });
+      mgr.isHandlingError = false;
+      mgr.player.play(createAudioResource(scStream, { inputType: StreamType.Arbitrary }));
+      mgr.activeTextChannel?.send(`🔄 YouTube sedang memblokir bot, beralih ke SoundCloud: **${sc.title}**`).catch(() => {});
+      await sendPlayerCard(guildId, track, false);
+    } catch (e) {
+      console.warn(`[Server ${guildId}] Fallback SoundCloud gagal:`, e.message);
+      mgr.activeTextChannel?.send(`⚠️ Gagal memutar **${track.title}** dari YouTube maupun SoundCloud.`).catch(() => {});
+      mgr.isHandlingError = false;
+      if (!mgr.destroyed && mgr.currentTrack === track) playNextSong(guildId);
+    }
+  })();
+}
+
 async function playNextSong(guildId) {
   const mgr = guildManagers.get(guildId);
   if (!mgr || mgr.destroyed) return;
@@ -1059,8 +1336,11 @@ async function playNextSong(guildId) {
         mgr.player.play(createAudioResource(fileStream, { inputType: StreamType.Arbitrary }));
       } else if (mgr.currentTrack.type === 'online') {
         let resource;
-        if (mgr.currentTrack.sourceName === YTDLP_SOURCE) {
-          const dlpStream = createYtDlpStream(mgr.currentTrack.url);
+        if (mgr.currentTrack.sourceName === YTDLP_SOURCE || mgr.currentTrack.sourceName === YTDLP_SC_SOURCE) {
+          const track = mgr.currentTrack;
+          const dlpStream = createYtDlpStream(track.url, {
+            onFail: msg => handleYtDlpPlaybackFail(guildId, track, msg)
+          });
           dlpStream.on('error', err => console.warn(`[Server ${guildId}] yt-dlp stream warning:`, err.message));
           resource = createAudioResource(dlpStream, { inputType: StreamType.Arbitrary });
         } else if (mgr.currentTrack.sourceName === 'YouTube HD' && ytdl) {

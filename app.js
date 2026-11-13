@@ -1,13 +1,3 @@
-# Kode Lengkap `app.js` (Perbaikan Tuntas: Distinct Client & Anti-404)
-
-Berikut adalah seluruh isi file `app.js` yang telah diperbaiki:
-1. Mengatasi error `clients must list distinct Client values` dengan menggunakan enum `Client.Tv`, `Client.WebEmbedded`, dan `Client.VisionOS`.
-2. Mencegah error `Got 404 from the request` pada SoundCloud dengan validasi kelayakan stream sebelum dipilih.
-3. Tetap mempertahankan sistem anti-duplikasi player card (in-place update) dan transcoding audio jernih melalui FFmpeg.
-
-Silakan salin seluruh kode di bawah ini lalu timpa ke file `app.js` di repositori GitHub Anda (`rippergx/discord-music-bot`).
-
-```javascript
 // --- CRASH GUARD (Mencegah bot mati saat terkena rate limit / error jaringan) ---
 process.on('unhandledRejection', (reason) => {
   console.warn('⚠️ Unhandled Rejection (Auto-Prevent Crash):', reason?.message || reason);
@@ -1323,7 +1313,3 @@ console.log('🤖 Menghubungkan bot ke Discord...');
 client.login(process.env.DISCORD_TOKEN).catch(err => {
   console.error('❌ GAGAL LOGIN KE DISCORD! Periksa DISCORD_TOKEN atau Privileged Intents:', err.message);
 });
-
-
-
-```

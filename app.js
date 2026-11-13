@@ -32,6 +32,7 @@ const {
   getVoiceConnection,
   createAudioPlayer,
   createAudioResource,
+  demuxProbe,
   AudioPlayerStatus,
   VoiceConnectionStatus,
   StreamType
@@ -213,18 +214,15 @@ async function searchOnlineTrack(query) {
         let info = null;
         let yt = getYouTubeInstance(true);
 
-        // Coba ambil info via Cookie
         if (yt) {
           try {
             info = await yt.getInfo(v.url);
           } catch (cErr) {
             console.warn('[YouTube Cookie Info Warning]:', cErr.message);
-            // Jika cookie signed-out / invalid, coba fallback ke Anonymous Client (VisionOS/Tv)
             const anonYt = getYouTubeInstance(false);
             if (anonYt) {
               try {
                 info = await anonYt.getInfo(v.url);
-                yt = anonYt;
               } catch (aErr) {
                 console.warn('[YouTube Anonymous Info Warning]:', aErr.message);
               }
@@ -241,19 +239,13 @@ async function searchOnlineTrack(query) {
           }
         }
 
-        if (info && yt) {
-          const stream = yt.download(info, {
-            quality: ytdlModule.Quality.HighestAudio,
-            filter: { hasAudio: true, hasVideo: false }
-          });
-
+        if (info) {
           return {
             title: info.videoDetails?.title || v.title,
             url: v.url,
             duration: parseInt(info.videoDetails?.lengthSeconds, 10) || v.seconds || 0,
             type: 'online',
-            sourceName: 'YouTube HD',
-            cachedStream: { stream, type: StreamType.Arbitrary }
+            sourceName: 'YouTube HD'
           };
         }
       }
@@ -269,18 +261,14 @@ async function searchOnlineTrack(query) {
     if (scResults && scResults.length > 0) {
       for (const t of scResults) {
         try {
-          const stream = await play.stream_from_info(t);
-          if (stream && stream.stream) {
-            const durationSec = t.durationInSec || (t.durationInMs ? Math.floor(t.durationInMs / 1000) : 0);
-            return {
-              title: t.name || t.title,
-              url: t.url,
-              duration: durationSec,
-              type: 'online',
-              sourceName: 'SoundCloud',
-              cachedStream: stream
-            };
-          }
+          const durationSec = t.durationInSec || (t.durationInMs ? Math.floor(t.durationInMs / 1000) : 0);
+          return {
+            title: t.name || t.title,
+            url: t.url,
+            duration: durationSec,
+            type: 'online',
+            sourceName: 'SoundCloud'
+          };
         } catch (streamErr) {
           console.warn(`[SoundCloud "${t.name || t.title}" 404 Go+ Skipped]: Lanjut ke lagu berikutnya...`);
         }
@@ -348,6 +336,14 @@ function getGuildManager(guildId) {
       progressInterval: null
     };
 
+    newPlayer.on(AudioPlayerStatus.Playing, () => {
+      console.log(`[Server ${guildId}] 🔊 Audio Player: Sedang memutar suara!`);
+    });
+
+    newPlayer.on(AudioPlayerStatus.Buffering, () => {
+      console.log(`[Server ${guildId}] ⏳ Audio Player: Sedang buffering...`);
+    });
+
     newPlayer.on(AudioPlayerStatus.Idle, () => {
       console.log(`[Server ${guildId}] Lagu selesai, lanjut ke berikutnya...`);
       stopProgressTicker(guildId);
@@ -358,7 +354,7 @@ function getGuildManager(guildId) {
     });
 
     newPlayer.on('error', error => {
-      console.error(`[Server ${guildId}] Audio Error:`, error.message);
+      console.error(`[Server ${guildId}] ❌ Audio Error:`, error.message);
       stopProgressTicker(guildId);
       playNextSong(guildId);
     });
@@ -416,8 +412,9 @@ function connectVoice(message, voiceChannel) {
       adapterCreator: message.guild.voiceAdapterCreator,
       selfDeaf: true
     });
-    connection.subscribe(mgr.player);
   }
+  // PASTIKAN SUARA PLAYER SELALU TERHUBUNG KE VOICE CHANNEL
+  connection.subscribe(mgr.player);
   return connection;
 }
 
@@ -511,6 +508,9 @@ async function executeSeek(guildId, targetSeconds) {
   mgr.currentTrack.startedAt = Date.now();
   mgr.currentTrack.pausedAt = null;
 
+  const conn = getVoiceConnection(guildId);
+  if (conn) conn.subscribe(mgr.player);
+
   if (mgr.currentTrack.type === 'file') {
     const ffmpeg = new prism.FFmpeg({
       args: [
@@ -525,10 +525,8 @@ async function executeSeek(guildId, targetSeconds) {
     });
 
     const resource = createAudioResource(ffmpeg, {
-      inputType: StreamType.Raw,
-      inlineVolume: true
+      inputType: StreamType.Raw
     });
-    if (resource.volume) resource.volume.setVolume(0.8);
     mgr.player.play(resource);
   } else if (mgr.currentTrack.type === 'online') {
     try {
@@ -536,34 +534,29 @@ async function executeSeek(guildId, targetSeconds) {
         const yt = getYouTubeInstance(true) || getYouTubeInstance(false);
         const rawStream = yt.download(mgr.currentTrack.url, {
           quality: ytdlModule.Quality.HighestAudio,
-          filter: { hasAudio: true, hasVideo: false }
+          filter: { hasAudio: true, hasVideo: false },
+          begin: `${Math.floor(targetSeconds)}s`,
+          highWaterMark: 1 << 25
         });
-        const ffmpeg = new prism.FFmpeg({
-          args: [
-            '-ss', String(mgr.currentTrack.seekOffset),
-            '-i', 'pipe:0',
-            '-analyzeduration', '0',
-            '-loglevel', '0',
-            '-f', 's16le',
-            '-ar', '48000',
-            '-ac', '2'
-          ]
-        });
-        rawStream.pipe(ffmpeg);
-        const resource = createAudioResource(ffmpeg, {
-          inputType: StreamType.Raw,
-          inlineVolume: true
-        });
-        if (resource.volume) resource.volume.setVolume(0.8);
-        mgr.player.play(resource);
+
+        try {
+          const { stream: probedStream, type } = await demuxProbe(rawStream);
+          const resource = createAudioResource(probedStream, { inputType: type });
+          mgr.player.play(resource);
+        } catch {
+          const resource = createAudioResource(rawStream, { inputType: StreamType.Arbitrary });
+          mgr.player.play(resource);
+        }
       } else {
         const stream = await play.stream(mgr.currentTrack.url, { seek: targetSeconds });
-        const resource = createAudioResource(stream.stream, {
-          inputType: stream.type,
-          inlineVolume: true
-        });
-        if (resource.volume) resource.volume.setVolume(0.8);
-        mgr.player.play(resource);
+        try {
+          const { stream: probedStream, type } = await demuxProbe(stream.stream);
+          const resource = createAudioResource(probedStream, { inputType: type });
+          mgr.player.play(resource);
+        } catch {
+          const resource = createAudioResource(stream.stream, { inputType: stream.type });
+          mgr.player.play(resource);
+        }
       }
     } catch (err) {
       console.error('Seek online error:', err.message);
@@ -680,41 +673,52 @@ async function playNextSong(guildId) {
   mgr.currentTrack.pausedAt = null;
   mgr.currentTrack.seekOffset = 0;
 
+  // Pastikan koneksi voice tersambung ke player
+  const conn = getVoiceConnection(guildId);
+  if (conn) {
+    conn.subscribe(mgr.player);
+  }
+
   if (mgr.currentTrack.type === 'file') {
     if (!mgr.currentTrack.duration) {
       mgr.currentTrack.duration = await getAudioDuration(mgr.currentTrack.path);
     }
-    const resource = createAudioResource(fs.createReadStream(mgr.currentTrack.path), {
-      inputType: StreamType.Arbitrary,
-      inlineVolume: true
-    });
-    if (resource.volume) resource.volume.setVolume(0.8);
-    mgr.player.play(resource);
+    const fileStream = fs.createReadStream(mgr.currentTrack.path);
+    try {
+      const { stream: probedStream, type } = await demuxProbe(fileStream);
+      const resource = createAudioResource(probedStream, { inputType: type });
+      mgr.player.play(resource);
+    } catch {
+      const resource = createAudioResource(fileStream, { inputType: StreamType.Arbitrary });
+      mgr.player.play(resource);
+    }
     await sendPlayerCard(guildId, mgr.currentTrack, false);
     startProgressTicker(guildId);
   } else if (mgr.currentTrack.type === 'online') {
     try {
-      let streamData = mgr.currentTrack.cachedStream;
-      if (!streamData) {
-        if (mgr.currentTrack.sourceName === 'YouTube HD' && ytdlModule) {
-          const yt = getYouTubeInstance(true) || getYouTubeInstance(false);
-          const stream = yt.download(mgr.currentTrack.url, {
-            quality: ytdlModule.Quality.HighestAudio,
-            filter: { hasAudio: true, hasVideo: false }
-          });
-          streamData = { stream, type: StreamType.Arbitrary };
-        } else {
-          streamData = await play.stream(mgr.currentTrack.url);
-        }
+      let rawStream = null;
+      if (mgr.currentTrack.sourceName === 'YouTube HD' && ytdlModule) {
+        const yt = getYouTubeInstance(true) || getYouTubeInstance(false);
+        rawStream = yt.download(mgr.currentTrack.url, {
+          quality: ytdlModule.Quality.HighestAudio,
+          filter: { hasAudio: true, hasVideo: false },
+          highWaterMark: 1 << 25
+        });
+      } else {
+        const scData = await play.stream(mgr.currentTrack.url);
+        rawStream = scData.stream;
       }
-      mgr.currentTrack.cachedStream = null;
 
-      const resource = createAudioResource(streamData.stream, {
-        inputType: streamData.type || StreamType.Arbitrary,
-        inlineVolume: true
-      });
-      if (resource.volume) resource.volume.setVolume(0.8);
-      mgr.player.play(resource);
+      // Gunakan demuxProbe agar audio Opus dari YouTube/SoundCloud langsung mengalir jernih tanpa transcode FFmpeg yang macet
+      try {
+        const { stream: probedStream, type } = await demuxProbe(rawStream);
+        const resource = createAudioResource(probedStream, { inputType: type });
+        mgr.player.play(resource);
+      } catch (probeErr) {
+        const resource = createAudioResource(rawStream, { inputType: StreamType.Arbitrary });
+        mgr.player.play(resource);
+      }
+
       await sendPlayerCard(guildId, mgr.currentTrack, false);
       startProgressTicker(guildId);
     } catch (err) {
@@ -726,13 +730,15 @@ async function playNextSong(guildId) {
     }
   } else if (mgr.currentTrack.type === 'stream') {
     mgr.currentTrack.duration = 0;
-    fetchAudioStream(mgr.currentTrack.url, stream => {
-      const resource = createAudioResource(stream, {
-        inputType: StreamType.Arbitrary,
-        inlineVolume: true
-      });
-      if (resource.volume) resource.volume.setVolume(0.8);
-      mgr.player.play(resource);
+    fetchAudioStream(mgr.currentTrack.url, async stream => {
+      try {
+        const { stream: probedStream, type } = await demuxProbe(stream);
+        const resource = createAudioResource(probedStream, { inputType: type });
+        mgr.player.play(resource);
+      } catch {
+        const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary });
+        mgr.player.play(resource);
+      }
     });
     await sendPlayerCard(guildId, mgr.currentTrack, false);
     startProgressTicker(guildId);
@@ -921,13 +927,15 @@ client.on('messageCreate', async message => {
       seekOffset: 0
     };
 
-    fetchAudioStream(station.url, stream => {
-      const resource = createAudioResource(stream, {
-        inputType: StreamType.Arbitrary,
-        inlineVolume: true
-      });
-      if (resource.volume) resource.volume.setVolume(0.8);
-      mgr.player.play(resource);
+    fetchAudioStream(station.url, async stream => {
+      try {
+        const { stream: probedStream, type } = await demuxProbe(stream);
+        const resource = createAudioResource(probedStream, { inputType: type });
+        mgr.player.play(resource);
+      } catch {
+        const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary });
+        mgr.player.play(resource);
+      }
     });
 
     await sendPlayerCard(guildId, mgr.currentTrack, false);

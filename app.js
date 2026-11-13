@@ -908,7 +908,7 @@ function buildPlayerEmbed(mgr, track, isPaused = false) {
 
   return new EmbedBuilder()
     .setColor(isPaused ? '#FEE75C' : '#57F287')
-    .setAuthor({ name: 'MUSIC PLAYER CONTROLLER' })
+    .setAuthor({ name: PLAYER_CARD_AUTHOR })
     .setTitle(`🎶 ${track.title}`.slice(0, 256))
     .setDescription(
       `📌 **Status:** ${playerState}\n` +
@@ -944,7 +944,8 @@ async function sendPlayerCard(guildId, track, isPaused = false) {
   const embed = buildPlayerEmbed(mgr, track, isPaused);
   const rows = buildPlayerButtons(mgr, isPaused);
 
-  if (mgr.lastPlayerMessage) {
+  // Edit di tempat hanya jika card masih menjadi pesan PALING BAWAH di channel
+  if (mgr.lastPlayerMessage && isPlayerCardAtBottom(mgr)) {
     try {
       await mgr.lastPlayerMessage.edit({ embeds: [embed], components: rows });
       return;
@@ -953,11 +954,67 @@ async function sendPlayerCard(guildId, track, isPaused = false) {
     }
   }
 
+  // Card sudah tertimpa pesan lain (atau belum ada) -> kirim ulang di bawah
+  await repostPlayerCard(guildId, { embeds: [embed], components: rows });
+}
+
+// ==========================================================
+// PLAYER CARD SELALU DI BAWAH
+// Setiap ada pesan baru di channel player, card lama dihapus & dikirim ulang
+// ==========================================================
+const PLAYER_CARD_AUTHOR = 'MUSIC PLAYER CONTROLLER';
+const REPOST_DELAY_MS = 1500; // debounce agar tidak spam saat chat ramai
+
+function isPlayerCardAtBottom(mgr) {
+  return (
+    mgr.lastPlayerMessage &&
+    mgr.activeTextChannel &&
+    mgr.lastPlayerMessage.channelId === mgr.activeTextChannel.id &&
+    mgr.activeTextChannel.lastMessageId === mgr.lastPlayerMessage.id
+  );
+}
+
+async function repostPlayerCard(guildId, payload = null) {
+  const mgr = guildManagers.get(guildId);
+  if (!mgr || !mgr.currentTrack || !mgr.activeTextChannel) return;
+  if (mgr.isReposting) {
+    mgr.repostPending = true; // ulangi setelah repost yang sedang berjalan selesai
+    return;
+  }
+  mgr.isReposting = true;
   try {
-    mgr.lastPlayerMessage = await mgr.activeTextChannel.send({ embeds: [embed], components: rows });
+    if (!payload) {
+      const isPaused = mgr.player.state.status === AudioPlayerStatus.Paused;
+      payload = {
+        embeds: [buildPlayerEmbed(mgr, mgr.currentTrack, isPaused)],
+        components: buildPlayerButtons(mgr, isPaused)
+      };
+    }
+    const oldCard = mgr.lastPlayerMessage;
+    // Kirim dulu yang baru, baru hapus yang lama -> card tidak pernah hilang
+    mgr.lastPlayerMessage = await mgr.activeTextChannel.send(payload);
+    if (oldCard) oldCard.delete().catch(() => {});
   } catch (err) {
     console.error(`[Server ${guildId}] Gagal kirim player card:`, err.message);
+  } finally {
+    mgr.isReposting = false;
+    if (mgr.repostPending) {
+      mgr.repostPending = false;
+      if (!isPlayerCardAtBottom(mgr)) schedulePlayerCardRepost(guildId);
+    }
   }
+}
+
+function schedulePlayerCardRepost(guildId) {
+  const mgr = guildManagers.get(guildId);
+  if (!mgr) return;
+  clearTimeout(mgr.repostTimer);
+  mgr.repostTimer = setTimeout(() => {
+    const m = guildManagers.get(guildId);
+    if (m && m.currentTrack && m.lastPlayerMessage && !isPlayerCardAtBottom(m)) {
+      repostPlayerCard(guildId);
+    }
+  }, REPOST_DELAY_MS);
 }
 
 async function playNextSong(guildId) {
@@ -1044,6 +1101,19 @@ async function playNextSong(guildId) {
 client.once('clientReady', () => {
   console.log(`✅ [LOGIN SUKSES] Logged in as ${client.user.tag}!`);
   console.log(`📡 Multi-Server aktif di ${client.guilds.cache.size} server.`);
+});
+
+// Pantau SEMUA pesan (termasuk balasan bot sendiri) di channel player
+// agar player card dipindah ke paling bawah
+client.on('messageCreate', message => {
+  if (!message.guild) return;
+  const mgr = guildManagers.get(message.guild.id);
+  if (!mgr || !mgr.currentTrack || !mgr.lastPlayerMessage || !mgr.activeTextChannel) return;
+  if (message.channelId !== mgr.activeTextChannel.id) return;
+  if (message.id === mgr.lastPlayerMessage.id) return;
+  // Abaikan player card itu sendiri (event bisa datang sebelum send() selesai)
+  if (message.author.id === client.user.id && message.embeds[0]?.author?.name === PLAYER_CARD_AUTHOR) return;
+  schedulePlayerCardRepost(message.guild.id);
 });
 
 client.on('messageCreate', async message => {

@@ -16,7 +16,8 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  EmbedBuilder
+  EmbedBuilder,
+  MessageFlags
 } = require('discord.js');
 const {
   joinVoiceChannel,
@@ -28,7 +29,7 @@ const {
   StreamType
 } = require('@discordjs/voice');
 
-// --- 1. INISIALISASI TOKEN SOUNDCLOUD (ANTI-BLOKIR SERVER) ---
+// --- 1. INISIALISASI TOKEN SOUNDCLOUD & YOUTUBE COOKIE (BYPASS BOT CHECK) ---
 let scInitialized = false;
 async function ensureSoundCloud() {
   if (scInitialized) return true;
@@ -41,7 +42,7 @@ async function ensureSoundCloud() {
         }
       });
       scInitialized = true;
-      console.log('✅ Token SoundCloud aktif (Bebas Blokir Datacenter).');
+      console.log('✅ Token SoundCloud aktif.');
       return true;
     }
   } catch (err) {
@@ -50,6 +51,29 @@ async function ensureSoundCloud() {
   return false;
 }
 ensureSoundCloud();
+
+let ytCookieInitialized = false;
+async function ensureYouTubeCookie() {
+  if (ytCookieInitialized) return true;
+  if (process.env.YOUTUBE_COOKIE && process.env.YOUTUBE_COOKIE.trim().length > 0) {
+    try {
+      await play.setToken({
+        youtube: {
+          cookie: process.env.YOUTUBE_COOKIE.trim()
+        }
+      });
+      ytCookieInitialized = true;
+      console.log('✅ YouTube Cookie aktif (BYPASS BOT SUKSES: Bebas blokir "Sign in to confirm you\'re not a bot").');
+      return true;
+    } catch (err) {
+      console.warn('⚠️ Gagal memuat YOUTUBE_COOKIE:', err.message);
+    }
+  } else {
+    console.log('ℹ️ YOUTUBE_COOKIE belum disetel di Railway Variables.');
+  }
+  return false;
+}
+ensureYouTubeCookie();
 
 // --- 2. WEB SERVER UNTUK HEALTHCHECK RAILWAY ---
 const PORT = process.env.PORT || 8080;
@@ -115,9 +139,10 @@ const client = new Client({
   ]
 });
 
-// --- 5. ENGINE PENCARIAN MUSIK ONLINE (DENGAN AUTO-FILTER GO+ 404) ---
+// --- 5. ENGINE PENCARIAN MUSIK ONLINE (YOUTUBE COOKIE AUTH + SOUNDCLOUD SMART FILTER) ---
 async function searchOnlineTrack(query) {
   await ensureSoundCloud();
+  await ensureYouTubeCookie();
 
   // Cek jika input adalah link Spotify
   try {
@@ -130,49 +155,92 @@ async function searchOnlineTrack(query) {
     }
   } catch (err) {}
 
-  // 1. CARI DI SOUNDCLOUD: FILTER OTOMATIS MELEWATI HASIL GO+ (404)
+  // JALUR 1: JIKA YOUTUBE COOKIE AKTIF, PRIORITASKAN YOUTUBE (100% LENGKAP & KUALITAS TINGGI)
+  if (process.env.YOUTUBE_COOKIE && process.env.YOUTUBE_COOKIE.trim().length > 0) {
+    try {
+      const searchRes = await yts(query);
+      if (searchRes && searchRes.videos && searchRes.videos.length > 0) {
+        for (const v of searchRes.videos.slice(0, 3)) {
+          try {
+            const stream = await play.stream(v.url);
+            if (stream && stream.stream) {
+              return {
+                title: v.title,
+                url: v.url,
+                duration: v.seconds || 0,
+                type: 'online',
+                sourceName: 'YouTube (Verified Cookie)',
+                cachedStream: stream
+              };
+            }
+          } catch (ytStreamErr) {
+            console.warn(`[YouTube] Gagal stream "${v.title}":`, ytStreamErr.message);
+          }
+        }
+      }
+    } catch (ytErr) {
+      console.warn('YouTube search error:', ytErr.message);
+    }
+  }
+
+  // JALUR 2: SOUNDCLOUD DENGAN SMART FILTER (STREAM-FROM-INFO)
+  const scQueries = [query, `${query} audio`, `${query} cover`];
+  for (const q of scQueries) {
+    try {
+      const scResults = await play.search(q, { limit: 5, source: { soundcloud: 'tracks' } });
+      if (scResults && scResults.length > 0) {
+        for (const t of scResults) {
+          try {
+            const testStream = await play.stream_from_info(t);
+            if (testStream && testStream.stream) {
+              const durationSec = t.durationInSec || (t.durationInMs ? Math.floor(t.durationInMs / 1000) : 0);
+              return {
+                title: t.name || t.title,
+                url: t.url,
+                duration: durationSec,
+                type: 'online',
+                sourceName: 'SoundCloud',
+                cachedStream: testStream
+              };
+            }
+          } catch (scErr) {
+            // Track Go+ / DRM 404, lanjut periksa hasil berikutnya
+          }
+        }
+      }
+    } catch (scSearchErr) {}
+  }
+
+  // JALUR 3: COBA YOUTUBE REGULER (JIKA BELUM ADA COOKIE)
   try {
-    const scResults = await play.search(query, { limit: 8, source: { soundcloud: 'tracks' } });
-    if (scResults && scResults.length > 0) {
-      for (const t of scResults) {
+    const searchRes = await yts(query);
+    if (searchRes && searchRes.videos && searchRes.videos.length > 0) {
+      for (const v of searchRes.videos.slice(0, 2)) {
         try {
-          // Uji apakah track ini bisa di-stream (bukan Go+ DRM)
-          const testStream = await play.stream(t.url);
-          if (testStream && testStream.stream) {
-            const durationSec = t.durationInSec || (t.durationInMs ? Math.floor(t.durationInMs / 1000) : 0);
+          const stream = await play.stream(v.url);
+          if (stream && stream.stream) {
             return {
-              title: t.name || t.title,
-              url: t.url,
-              duration: durationSec,
+              title: v.title,
+              url: v.url,
+              duration: v.seconds || 0,
               type: 'online',
-              sourceName: 'SoundCloud',
-              cachedStream: testStream // Kunci stream yang sudah terbukti valid!
+              sourceName: 'YouTube',
+              cachedStream: stream
             };
           }
-        } catch (streamErr) {
-          console.log(`[SoundCloud] Melewati track berbayar (Go+ 404): "${t.name || t.title}"`);
+        } catch (ytDirectErr) {
+          if (ytDirectErr.message && ytDirectErr.message.includes('Sign in to confirm')) {
+            console.warn('[YouTube] Terdeteksi bot block ("Sign in to confirm you\'re not a bot"). Perlu YOUTUBE_COOKIE!');
+            return {
+              error: 'BOT_BLOCKED',
+              title: v.title
+            };
+          }
         }
       }
     }
   } catch (err) {
-    console.warn('SoundCloud search warning:', err.message);
-  }
-
-  // 2. JIKA SEMUA TRACK SOUNDCLOUD GO+, FALLBACK KE YOUTUBE
-  try {
-    const searchRes = await yts(query);
-    if (searchRes && searchRes.videos && searchRes.videos.length > 0) {
-      const v = searchRes.videos[0];
-      return {
-        title: v.title,
-        url: v.url,
-        duration: v.seconds || 0,
-        type: 'online',
-        sourceName: 'YouTube'
-      };
-    }
-  } catch (err) {
-    console.warn('YouTube search warning:', err.message);
+    console.warn('YouTube fallback search warning:', err.message);
   }
 
   return null;
@@ -258,45 +326,72 @@ function startProgressTicker(guildId) {
   stopProgressTicker(guildId);
 
   mgr.progressInterval = setInterval(async () => {
-    if (!mgr.currentTrack || !mgr.lastPlayerMessage || mgr.player.state.status !== AudioPlayerStatus.Playing) {
+    if (!mgr.currentTrack || !mgr.lastPlayerMessage || !mgr.activeTextChannel) {
+      stopProgressTicker(guildId);
       return;
     }
 
-    try {
-      const embed = buildPlayerEmbed(mgr, mgr.currentTrack, false);
-      const rows = buildPlayerButtons(mgr, false);
-      await mgr.lastPlayerMessage.edit({ embeds: [embed], components: rows }).catch(() => {});
-    } catch (err) {}
+    if (mgr.player.state.status === AudioPlayerStatus.Playing) {
+      try {
+        const embed = buildPlayerEmbed(mgr, mgr.currentTrack, false);
+        const rows = buildPlayerButtons(mgr, false);
+        await mgr.lastPlayerMessage.edit({ embeds: [embed], components: rows });
+      } catch (err) {
+        if (err.code === 10008) {
+          stopProgressTicker(guildId);
+          mgr.lastPlayerMessage = null;
+        }
+      }
+    }
   }, 5000);
 }
 
 function stopProgressTicker(guildId) {
-  const mgr = getGuildManager(guildId);
-  if (mgr.progressInterval) {
+  const mgr = guildManagers.get(guildId);
+  if (mgr && mgr.progressInterval) {
     clearInterval(mgr.progressInterval);
     mgr.progressInterval = null;
   }
 }
 
-// Direktori Musik
 const MUSIC_DIR = path.join(__dirname, 'Music');
-if (!fs.existsSync(MUSIC_DIR)) {
-  fs.mkdirSync(MUSIC_DIR, { recursive: true });
+
+function connectVoice(message, voiceChannel) {
+  const guildId = message.guild.id;
+  const mgr = getGuildManager(guildId);
+  mgr.activeTextChannel = message.channel;
+
+  let connection = getVoiceConnection(guildId);
+  if (!connection) {
+    connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId: guildId,
+      adapterCreator: message.guild.voiceAdapterCreator,
+      selfDeaf: true
+    });
+    connection.subscribe(mgr.player);
+  }
+  return connection;
 }
 
 function formatTime(seconds) {
-  const mins = Math.floor(seconds / 60);
-  const secs = Math.floor(seconds % 60);
-  return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  const total = Math.max(0, Math.floor(seconds));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${s < 10 ? '0' : ''}${s}`;
 }
 
 function parseTimeToSeconds(timeStr) {
   if (!timeStr) return null;
-  const parts = timeStr.split(':').map(Number);
-  if (parts.some(isNaN)) return null;
-  if (parts.length === 1) return parts[0];
-  if (parts.length === 2) return parts[0] * 60 + parts[1];
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  const parts = timeStr.trim().split(':');
+  if (parts.length === 2) {
+    const mins = parseInt(parts[0], 10);
+    const secs = parseInt(parts[1], 10);
+    if (!isNaN(mins) && !isNaN(secs)) return mins * 60 + secs;
+  } else if (parts.length === 1) {
+    const secs = parseInt(parts[0], 10);
+    if (!isNaN(secs)) return secs;
+  }
   return null;
 }
 
@@ -321,6 +416,7 @@ function getPlaylists() {
 }
 
 function findSingleSong(query) {
+  if (!fs.existsSync(MUSIC_DIR)) return null;
   const q = query.toLowerCase();
   const rootFiles = fs.readdirSync(MUSIC_DIR).filter(f => f.endsWith('.mp3') || f.endsWith('.wav') || f.endsWith('.ogg'));
   let match = rootFiles.find(f => f.toLowerCase() === q || f.toLowerCase() === `${q}.mp3` || f.toLowerCase().includes(q));
@@ -524,7 +620,6 @@ async function playNextSong(guildId) {
     startProgressTicker(guildId);
   } else if (mgr.currentTrack.type === 'online') {
     try {
-      // Gunakan stream yang sudah diverifikasi saat pencarian
       let streamData = mgr.currentTrack.cachedStream;
       if (!streamData) {
         streamData = await play.stream(mgr.currentTrack.url);
@@ -542,7 +637,7 @@ async function playNextSong(guildId) {
     } catch (err) {
       console.error(`[Server ${guildId}] Error streaming online track:`, err.message);
       if (mgr.activeTextChannel) {
-        mgr.activeTextChannel.send(`⚠️ Gagal memutar **${mgr.currentTrack.title}**, lanjut lagu berikutnya...`);
+        mgr.activeTextChannel.send(`⚠️ Gagal memutar **${mgr.currentTrack.title}**: ${err.message}`);
       }
       playNextSong(guildId);
     }
@@ -561,38 +656,12 @@ async function playNextSong(guildId) {
   }
 }
 
-function connectVoice(message, voiceChannel) {
-  const mgr = getGuildManager(message.guild.id);
-  mgr.activeTextChannel = message.channel;
-
-  let connection = getVoiceConnection(message.guild.id);
-  if (!connection || connection.state.status === VoiceConnectionStatus.Destroyed) {
-    connection = joinVoiceChannel({
-      channelId: voiceChannel.id,
-      guildId: message.guild.id,
-      adapterCreator: message.guild.voiceAdapterCreator,
-      selfDeaf: true,
-      selfMute: false
-    });
-  }
-
-  connection.subscribe(mgr.player);
-  return connection;
-}
-
 // --- 7. EVENT LISTENERS DISCORD ---
 client.once('clientReady', () => {
   console.log(`✅ [LOGIN SUKSES] Logged in as ${client.user.tag}!`);
   console.log(`📡 Multi-Server aktif di ${client.guilds.cache.size} server.`);
 });
-client.once('ready', () => {
-  console.log(`✅ [LOGIN SUKSES] Logged in as ${client.user.tag}!`);
-});
 
-client.on('error', err => console.error('❌ Discord Client Error:', err));
-client.on('warn', warn => console.warn('⚠️ Discord Client Warning:', warn));
-
-// --- 8. COMMAND HANDLER ---
 client.on('messageCreate', async message => {
   if (message.author.bot || !message.guild) return;
   const guildId = message.guild.id;
@@ -611,44 +680,50 @@ client.on('messageCreate', async message => {
     if (!allData[guildId][dateKey]) allData[guildId][dateKey] = [];
 
     const todayList = allData[guildId][dateKey];
-
     const existing = todayList.find(item => item.userId === message.author.id);
     if (existing) {
       const alreadyEmbed = new EmbedBuilder()
         .setColor('#FEE75C')
         .setTitle('⚠️ Kamu Sudah Absen Hari Ini!')
         .setDescription(
-          `Halo **${message.member?.displayName || message.author.username}**, kamu sudah tercatat hadir pada:\n` +
-          `📅 **Tanggal:** ${existing.dateStr}\n` +
-          `⏰ **Waktu:** ${existing.timeStr}`
+          `Halo <@${message.author.id}>, kamu sudah tercatat absen pada:\n` +
+          `📅 **Tanggal:** ${dateFormatted}\n` +
+          `⏰ **Waktu:** ${existing.time}`
         )
         .setFooter({ text: 'Absensi hanya bisa dilakukan 1x per hari.' });
       return message.channel.send({ embeds: [alreadyEmbed] });
     }
 
-    const displayName = message.member?.displayName || message.author.username;
-    const newEntry = {
+    const attendanceRecord = {
       userId: message.author.id,
-      displayName: displayName,
-      username: message.author.username,
-      dateStr: dateFormatted,
-      timeStr: timeFormatted,
+      displayName: message.member?.displayName || message.author.username,
+      tag: message.author.tag,
+      time: timeFormatted,
       timestamp: Date.now()
     };
 
-    todayList.push(newEntry);
+    todayList.push(attendanceRecord);
     saveAttendance(allData);
 
     const successEmbed = new EmbedBuilder()
       .setColor('#57F287')
-      .setTitle('✅ Absensi Berhasil Tercatat!')
-      .setThumbnail(message.author.displayAvatarURL({ dynamic: true }))
-      .addFields(
-        { name: '👤 Nama Discord', value: `**${displayName}** (\`@${message.author.username}\`)`, inline: false },
-        { name: '📅 Tanggal', value: dateFormatted, inline: true },
-        { name: '⏰ Waktu Absen', value: timeFormatted, inline: true }
+      .setAuthor({
+        name: 'PRESENSI / ABSENSI BERHASIL',
+        iconURL: message.author.displayAvatarURL({ dynamic: true })
+      })
+      .setThumbnail(message.author.displayAvatarURL({ dynamic: true, size: 256 }))
+      .setTitle(`✅ Kehadiran Terverifikasi: ${attendanceRecord.displayName}`)
+      .setDescription(
+        `Terima kasih telah hadir di server hari ini!\n\n` +
+        `👤 **Nama Member:** <@${message.author.id}> (\`${message.author.username}\`)\n` +
+        `📅 **Tanggal:** ${dateFormatted}\n` +
+        `⏰ **Waktu Hadir:** \`${timeFormatted}\`\n` +
+        `📊 **Total Hadir Hari Ini:** \`${todayList.length} orang\``
       )
-      .setFooter({ text: `Urutan kehadiran hari ini: #${todayList.length}` })
+      .setFooter({
+        text: `Sistem Presensi • Server: ${message.guild.name}`,
+        iconURL: message.guild.iconURL() || undefined
+      })
       .setTimestamp();
 
     return message.channel.send({ embeds: [successEmbed] });
@@ -657,106 +732,121 @@ client.on('messageCreate', async message => {
   if (message.content.startsWith('!logabsen')) {
     await message.delete().catch(() => {});
 
-    const args = message.content.split(' ').slice(1).join(' ').trim().toLowerCase();
+    const args = message.content.split(' ').slice(1);
+    const subParam = args[0] ? args[0].toLowerCase() : null;
     const allData = loadAttendance();
-    const serverData = allData[guildId] || {};
+    const guildData = allData[guildId] || {};
 
-    const { dateKey: todayKey, dateFormatted: todayFormatted } = getWIBTime();
+    let targetDateKey = null;
+    let targetDateLabel = '';
 
-    if (args === 'riwayat' || args === 'history' || args === 'list') {
-      const dates = Object.keys(serverData).sort().reverse();
-      if (dates.length === 0) {
-        return message.channel.send('📂 Belum ada catatan absensi sama sekali di server ini.');
-      }
-      const dateListText = dates.slice(0, 10).map(d => `• \`!logabsen ${d}\` (${serverData[d].length} orang hadir)`).join('\n');
-      return message.channel.send(`📅 **Riwayat Tanggal Absensi Tersedia:**\n${dateListText}\n\n*Ketik perintah di atas untuk melihat detailnya!*`);
-    }
-
-    let targetDateKey = todayKey;
-    let targetLabel = todayFormatted;
-
-    if (!args || args === 'hari ini' || args === 'today') {
-      targetDateKey = todayKey;
-      targetLabel = todayFormatted;
-    } else if (args === 'kemarin' || args === 'yesterday') {
+    if (!subParam) {
+      const nowWIB = getWIBTime();
+      targetDateKey = nowWIB.dateKey;
+      targetDateLabel = `Hari Ini (${nowWIB.dateFormatted})`;
+    } else if (subParam === 'kemarin') {
       const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
-      const yInfo = getWIBTime(yesterday);
-      targetDateKey = yInfo.dateKey;
-      targetLabel = yInfo.dateFormatted;
-    } else {
-      let parsed = args.replace(/\//g, '-');
-      const parts = parsed.split('-');
-      if (parts.length === 3) {
-        if (parts[0].length === 4) {
-          targetDateKey = `${parts[0]}-${parts[1].padStart(2, '0')}-${parts[2].padStart(2, '0')}`;
-        } else if (parts[2].length === 4) {
-          targetDateKey = `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
-        }
-      } else {
-        targetDateKey = args;
+      const yWIB = getWIBTime(yesterday);
+      targetDateKey = yWIB.dateKey;
+      targetDateLabel = `Kemarin (${yWIB.dateFormatted})`;
+    } else if (subParam === 'riwayat') {
+      const availableDates = Object.keys(guildData).sort().reverse();
+      if (availableDates.length === 0) {
+        return message.channel.send('📭 Belum ada riwayat absensi yang tersimpan di server ini.');
       }
-      targetLabel = `Tanggal ${targetDateKey}`;
+      const historySummary = availableDates.slice(0, 7).map(d => {
+        const count = guildData[d].length;
+        return `• 📅 \`${d}\` ➔ **${count} member hadir**`;
+      }).join('\n');
+
+      const historyEmbed = new EmbedBuilder()
+        .setColor('#5865F2')
+        .setTitle('🗓️ Riwayat Tanggal Absensi (7 Hari Terakhir)')
+        .setDescription(
+          `${historySummary}\n\n` +
+          `*💡 Ketik \`!logabsen YYYY-MM-DD\` (contoh: \`!logabsen 2026-11-13\`) untuk melihat rincian nama di tanggal tersebut.*`
+        )
+        .setFooter({ text: `Server: ${message.guild.name}` });
+      return message.channel.send({ embeds: [historyEmbed] });
+    } else if (/^\d{4}-\d{2}-\d{2}$/.test(subParam)) {
+      targetDateKey = subParam;
+      targetDateLabel = `Tanggal ${subParam}`;
+    } else {
+      return message.channel.send(
+        '⚠️ Format perintah tidak dikenal!\n' +
+        '💡 **Contoh penggunaan:**\n' +
+        '• `!logabsen` : Lihat yang hadir hari ini\n' +
+        '• `!logabsen kemarin` : Lihat yang hadir kemarin\n' +
+        '• `!logabsen riwayat` : Lihat ringkasan tanggal absensi\n' +
+        '• `!logabsen 2026-11-13` : Lihat tanggal spesifik'
+      );
     }
 
-    const targetList = serverData[targetDateKey] || [];
-
-    if (targetList.length === 0) {
+    const list = guildData[targetDateKey] || [];
+    if (list.length === 0) {
       const emptyEmbed = new EmbedBuilder()
-        .setColor('#5865F2')
-        .setTitle(`📋 DAFTAR HADIR`)
-        .setDescription(
-          `📅 **${targetLabel}**\n\n` +
-          `_Tidak ada data absensi yang tercatat pada tanggal ini._\n\n` +
-          `💡 *Tips: Ketik \`!logabsen\` untuk hari ini, atau \`!logabsen riwayat\` untuk melihat tanggal yang tersimpan.*`
-        );
+        .setColor('#ED4245')
+        .setTitle(`📋 Rekap Presensi: ${targetDateLabel}`)
+        .setDescription(`Belum ada member yang melakukan absensi pada tanggal ini.\nKetik \`!absen\` untuk mencatat kehadiran!`)
+        .setFooter({ text: `Server: ${message.guild.name}` });
       return message.channel.send({ embeds: [emptyEmbed] });
     }
 
-    const listText = targetList
-      .map((item, idx) => `**${idx + 1}.** 👤 **${item.displayName}** (\`@${item.username}\`) • ⏰ \`${item.timeStr}\``)
-      .join('\n');
+    const attendeeLines = list.map((item, idx) => {
+      return `**${idx + 1}.** <@${item.userId}> (\`${item.displayName}\`) • ⏰ \`${item.time}\``;
+    });
 
     const logEmbed = new EmbedBuilder()
       .setColor('#5865F2')
-      .setTitle(`📋 DAFTAR HADIR`)
-      .setDescription(`📅 **${targetList[0]?.dateStr || targetLabel}**\n\n${listText}`)
-      .setFooter({ text: `Total Hadir: ${targetList.length} orang` })
+      .setTitle(`📋 Daftar Kehadiran: ${targetDateLabel}`)
+      .setDescription(
+        `Total Hadir: **${list.length} member**\n\n` +
+        attendeeLines.slice(0, 30).join('\n') +
+        (attendeeLines.length > 30 ? `\n*...dan ${attendeeLines.length - 30} member lainnya.*` : '')
+      )
+      .setFooter({
+        text: `Server: ${message.guild.name} • Total: ${list.length} Orang`,
+        iconURL: message.guild.iconURL() || undefined
+      })
       .setTimestamp();
 
     return message.channel.send({ embeds: [logEmbed] });
   }
 
   // ==========================================
-  // FITUR TEST KONEKSI & MUSIK PLAYER
+  // COMMAND: !help
   // ==========================================
-  if (message.content === '!ping') {
-    return message.reply('🏓 **Pong!** Bot aktif dan siap melayani server ini!');
-  }
-
   if (message.content === '!help') {
-    return message.reply(`🎧 **Panduan Perintah Bot:**\n\n` +
-      `🔍 **PENCARIAN MUSIK ONLINE (YOUTUBE / SPOTIFY / SOUNDCLOUD):**\n` +
-      `• \`!play <judul lagu>\` : Cari & putar lagu langsung (contoh: \`!play sial mahalini\`)\n` +
-      `• \`!play <link>\` : Putar dari link Spotify / SoundCloud / YouTube\n\n` +
-      `📻 **RADIO LIVE 24/7:**\n` +
-      `• \`!radio\` : Lihat daftar channel radio\n` +
-      `• \`!radio lofi\` : Putar Lofi Beats 24/7\n\n` +
-      `📁 **FOLDER PLAYLIST:**\n` +
-      `• \`!playlists\` : Lihat daftar folder playlist di server\n` +
-      `• \`!play <nama playlist>\` : Putar lagu folder\n\n` +
-      `📋 **SISTEM ABSENSI:**\n` +
-      `• \`!absen\` : Absen kehadiran hari ini (chat perintah otomatis dihapus)\n` +
-      `• \`!logabsen\` : Lihat daftar hadir hari ini\n` +
-      `• \`!logabsen kemarin\` : Lihat daftar hadir kemarin`);
+    return message.reply(
+      `🎧 **PANDUAN PERINTAH BOT MUSIK & ABSENSI** 🎧\n\n` +
+      `🎵 **PEMUTAR MUSIK:**\n` +
+      `• \`!play <judul / link>\` : Cari & putar lagu dari YouTube / SoundCloud / Lokal\n` +
+      `• \`!seek <menit:detik>\` : Lompat ke menit tertentu (contoh: \`!seek 1:30\` atau \`!seek 90\`)\n` +
+      `• \`!queue\` : Lihat daftar antrean lagu saat ini\n` +
+      `• \`!radio <stasiun>\` : Putar siaran radio live 24/7 (contoh: \`!radio lofi\`)\n` +
+      `• \`!playlists\` : Lihat daftar folder lagu lokal di server\n\n` +
+      `📋 **SISTEM ABSENSI (WIB):**\n` +
+      `• \`!absen\` : Catat kehadiran kamu hari ini (chat otomatis dibersihkan)\n` +
+      `• \`!logabsen\` : Lihat daftar yang sudah hadir hari ini\n` +
+      `• \`!logabsen kemarin\` : Lihat daftar yang hadir kemarin\n` +
+      `• \`!logabsen riwayat\` : Lihat rekap kehadiran 7 hari terakhir\n` +
+      `• \`!logabsen YYYY-MM-DD\` : Lihat kehadiran pada tanggal tertentu\n\n` +
+      `🛡️ **ADMIN:**\n` +
+      `• \`!setup-verify\` : Pasang tombol verifikasi otomatis member baru`
+    );
   }
 
   if (message.content.startsWith('!seek')) {
-    const arg = message.content.split(' ')[1];
-    if (!arg) return message.reply('⚠️ Format: `!seek <menit:detik>` (contoh: `!seek 01:30`).');
-    if (!mgr.currentTrack || mgr.currentTrack.type === 'stream') return message.reply('⚠️ Tidak ada lagu yang bisa di-seek.');
+    const args = message.content.split(' ').slice(1);
+    if (!args[0]) return message.reply('⚠️ Masukkan waktu tujuan! Contoh: `!seek 1:30` atau `!seek 90`');
 
-    const targetSeconds = parseTimeToSeconds(arg);
-    if (targetSeconds === null || targetSeconds < 0) return message.reply('⚠️ Format waktu tidak valid! Contoh: `!seek 02:45`.');
+    const targetSeconds = parseTimeToSeconds(args[0]);
+    if (targetSeconds === null || targetSeconds < 0) {
+      return message.reply('⚠️ Format waktu tidak valid! Gunakan format `menit:detik` (contoh: `1:30`) atau detik (`90`).');
+    }
+
+    if (!mgr.currentTrack) return message.reply('⚠️ Tidak ada lagu yang sedang diputar.');
+    if (mgr.currentTrack.type === 'stream') return message.reply('⚠️ Radio stream 24/7 tidak mendukung seek/lompat waktu.');
 
     await executeSeek(guildId, targetSeconds);
     return message.reply(`⏩ Melompat ke menit **${formatTime(targetSeconds)}**! 🔊`);
@@ -851,12 +941,25 @@ client.on('messageCreate', async message => {
       return;
     }
 
-    // 3. PENCARIAN ONLINE DENGAN AUTO-FILTER GO+ (404)
+    // 3. PENCARIAN ONLINE DENGAN BYPASS BOT & AUTO-FALLBACK
     const searchMsg = await message.reply(`🔍 Mencari lagu **"${query}"**...`);
     const onlineTrack = await searchOnlineTrack(query);
 
     if (!onlineTrack) {
-      return searchMsg.edit(`❌ Tidak ditemukan versi lagu yang dapat diputar untuk **"${query}"**.`);
+      return searchMsg.edit(`❌ Tidak ditemukan lagu yang dapat diputar untuk **"${query}"**.\n💡 *Coba judul yang lebih spesifik atau putar lagu lokal dari folder \`Music\`!*`);
+    }
+
+    if (onlineTrack.error === 'BOT_BLOCKED') {
+      return searchMsg.edit(
+        `🛡️ **YouTube Meminta Autentikasi Akun (Anti-Bot Datacenter):**\n` +
+        `Lagu ditemukan (**${onlineTrack.title}**), namun YouTube memblokir IP cloud server Railway dengan status: *"Sign in to confirm you're not a bot"*.\n\n` +
+        `🔑 **Solusi Resmi & 100% Permanen:**\n` +
+        `Tambahkan Cookie YouTube ke Railway Variables:\n` +
+        `1. Install ekstensi browser **Cookie-Editor** di Chrome / Edge.\n` +
+        `2. Buka \`youtube.com\` (pastikan sudah login akun) ➔ Export Cookie string.\n` +
+        `3. Buka Railway ➔ Service bot ➔ Tab **Variables** ➔ Buat variabel: \`YOUTUBE_COOKIE\` = *(paste teks cookie)*.\n` +
+        `4. Bot akan otomatis bypass dan bebas streaming semua lagu YouTube 24/7! 🚀`
+      );
     }
 
     connectVoice(message, voiceChannel);
@@ -899,64 +1002,51 @@ client.on('messageCreate', async message => {
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('btn_verify').setLabel('Verifikasi').setStyle(ButtonStyle.Success).setEmoji('✅')
     );
-    await message.channel.send({ embeds: [embed], components: [row] });
-    return message.delete().catch(() => {});
+
+    return message.channel.send({ embeds: [embed], components: [row] });
   }
 });
 
-// --- 9. INTERAKSI TOMBOL ---
+// --- 8. INTERACTION BUTTON CONTROLLER ---
 client.on('interactionCreate', async interaction => {
   if (!interaction.isButton()) return;
-  const guildId = interaction.guild?.id;
-  if (!guildId) return;
+  const guildId = interaction.guildId;
   const mgr = getGuildManager(guildId);
 
-  // Verifikasi Member
+  // Verifikasi Member Baru
   if (interaction.customId === 'btn_verify') {
-    const roleId = process.env.VERIFIED_ROLE_ID;
-    if (!roleId) return interaction.reply({ content: '⚠️ ID Role belum diatur.', ephemeral: true });
-    const role = interaction.guild.roles.cache.get(roleId);
-    if (!role) return interaction.reply({ content: '⚠️ Role tidak ditemukan.', ephemeral: true });
-    if (interaction.member.roles.cache.has(roleId)) {
-      return interaction.reply({ content: 'ℹ️ Kamu sudah terverifikasi!', ephemeral: true });
+    const member = interaction.member;
+    const accountAgeDays = (Date.now() - member.user.createdTimestamp) / (1000 * 60 * 60 * 24);
+
+    if (accountAgeDays < 30) {
+      return interaction.reply({
+        content: `❌ Umur akun kamu baru **${Math.floor(accountAgeDays)} hari**. Minimal 30 hari untuk dapat diverifikasi demi keamanan server.`,
+        flags: MessageFlags.Ephemeral
+      });
     }
 
-    const daysDiff = (Date.now() - interaction.user.createdTimestamp) / (1000 * 60 * 60 * 24);
-    if (daysDiff < 30) {
-      return interaction.reply({ content: `❌ Umur akun baru **${Math.floor(daysDiff)} hari**. Minimal 30 hari.`, ephemeral: true });
-    }
-
-    try {
-      await interaction.member.roles.add(role);
-      return interaction.reply({ content: '🎉 Berhasil diverifikasi!', ephemeral: true });
-    } catch (err) {
-      return interaction.reply({ content: '⚠️ Gagal memberi role.', ephemeral: true });
+    const verifiedRole = interaction.guild.roles.cache.find(r => r.name.toLowerCase() === 'verified' || r.name.toLowerCase() === 'member');
+    if (verifiedRole) {
+      await member.roles.add(verifiedRole).catch(console.error);
+      return interaction.reply({
+        content: `✅ Akun kamu berusia **${Math.floor(accountAgeDays)} hari**. Verifikasi berhasil! Role **${verifiedRole.name}** telah diberikan.`,
+        flags: MessageFlags.Ephemeral
+      });
+    } else {
+      return interaction.reply({
+        content: `✅ Umur akun valid (**${Math.floor(accountAgeDays)} hari**). Role "Verified" / "Member" belum dibuat di server ini oleh Admin.`,
+        flags: MessageFlags.Ephemeral
+      });
     }
   }
 
-  // Tombol Musik Player
+  // Tombol Player Controller
   if (interaction.customId.startsWith('btn_player_')) {
-    const voiceChannel = interaction.member?.voice?.channel;
-    if (!voiceChannel) {
-      return interaction.reply({ content: '⚠️ Kamu harus berada di Voice Channel!', ephemeral: true });
-    }
-
-    if (interaction.customId === 'btn_player_rewind10') {
-      if (!mgr.currentTrack || mgr.currentTrack.type === 'stream') return interaction.reply({ content: '⚠️ Tidak bisa rewind pada siaran radio.', ephemeral: true });
-      const newPos = Math.max(0, getCurrentPlaybackSeconds(mgr) - 10);
-      await executeSeek(guildId, newPos);
-      return interaction.reply({ content: `⏪ Mundur ke **${formatTime(newPos)}**`, ephemeral: true });
-    }
-
-    if (interaction.customId === 'btn_player_forward10') {
-      if (!mgr.currentTrack || mgr.currentTrack.type === 'stream') return interaction.reply({ content: '⚠️ Tidak bisa forward pada siaran radio.', ephemeral: true });
-      const newPos = getCurrentPlaybackSeconds(mgr) + 10;
-      await executeSeek(guildId, newPos);
-      return interaction.reply({ content: `⏩ Maju ke **${formatTime(newPos)}**`, ephemeral: true });
+    if (!mgr.currentTrack) {
+      return interaction.reply({ content: '⚠️ Tidak ada lagu yang sedang diputar saat ini.', flags: MessageFlags.Ephemeral });
     }
 
     if (interaction.customId === 'btn_player_playpause') {
-      if (!mgr.currentTrack) return interaction.reply({ content: '⚠️ Tidak ada lagu berputar.', ephemeral: true });
       if (mgr.player.state.status === AudioPlayerStatus.Playing) {
         mgr.player.pause();
         mgr.currentTrack.pausedAt = Date.now();
@@ -965,39 +1055,51 @@ client.on('interactionCreate', async interaction => {
         const embed = buildPlayerEmbed(mgr, mgr.currentTrack, true);
         const rows = buildPlayerButtons(mgr, true);
         await interaction.update({ embeds: [embed], components: rows });
-      } else {
-        mgr.player.unpause();
+      } else if (mgr.player.state.status === AudioPlayerStatus.Paused) {
         if (mgr.currentTrack.pausedAt) {
-          const pauseDuration = Date.now() - mgr.currentTrack.pausedAt;
-          mgr.currentTrack.startedAt += pauseDuration;
+          mgr.currentTrack.startedAt += (Date.now() - mgr.currentTrack.pausedAt);
           mgr.currentTrack.pausedAt = null;
         }
-        startProgressTicker(guildId);
+        mgr.player.unpause();
 
         const embed = buildPlayerEmbed(mgr, mgr.currentTrack, false);
         const rows = buildPlayerButtons(mgr, false);
         await interaction.update({ embeds: [embed], components: rows });
+        startProgressTicker(guildId);
+      } else {
+        await interaction.reply({ content: '⚠️ Status player tidak dapat diubah.', flags: MessageFlags.Ephemeral });
       }
       return;
     }
 
+    if (interaction.customId === 'btn_player_rewind10') {
+      const current = getCurrentPlaybackSeconds(mgr);
+      const target = Math.max(0, current - 10);
+      await executeSeek(guildId, target);
+      return interaction.reply({ content: `⏪ Mundur 10 detik (sekarang: **${formatTime(target)}**).`, flags: MessageFlags.Ephemeral });
+    }
+
+    if (interaction.customId === 'btn_player_forward10') {
+      const current = getCurrentPlaybackSeconds(mgr);
+      const target = current + 10;
+      await executeSeek(guildId, target);
+      return interaction.reply({ content: `⏩ Maju 10 detik (sekarang: **${formatTime(target)}**).`, flags: MessageFlags.Ephemeral });
+    }
+
     if (interaction.customId === 'btn_player_skip') {
-      if (!mgr.currentTrack) return interaction.reply({ content: '⚠️ Tidak ada lagu untuk di-skip.', ephemeral: true });
-      await interaction.reply({ content: `⏭️ **${interaction.user.username}** melewati lagu.`, ephemeral: false });
-      stopProgressTicker(guildId);
+      await interaction.reply({ content: '⏭️ Melanjutkan ke lagu berikutnya...', flags: MessageFlags.Ephemeral });
       mgr.player.stop();
       return;
     }
 
     if (interaction.customId === 'btn_player_shuffle') {
-      if (mgr.musicQueue.length <= 1) return interaction.reply({ content: '⚠️ Butuh minimal 2 lagu untuk shuffle.', ephemeral: true });
       shuffleArray(mgr.musicQueue);
       if (mgr.currentTrack) {
         const embed = buildPlayerEmbed(mgr, mgr.currentTrack, false);
         const rows = buildPlayerButtons(mgr, false);
         await interaction.update({ embeds: [embed], components: rows });
       }
-      return interaction.reply({ content: '🔀 **Antrean di server ini berhasil diacak!**', ephemeral: true });
+      return interaction.reply({ content: '🔀 **Antrean di server ini berhasil diacak!**', flags: MessageFlags.Ephemeral });
     }
 
     if (interaction.customId === 'btn_player_loop') {
@@ -1007,7 +1109,7 @@ client.on('interactionCreate', async interaction => {
         const rows = buildPlayerButtons(mgr, false);
         await interaction.update({ embeds: [embed], components: rows });
       }
-      return interaction.reply({ content: `🔁 Mode Loop di server ini: **${mgr.isLoopQueue ? 'AKTIF' : 'NONAKTIF'}**`, ephemeral: true });
+      return interaction.reply({ content: `🔁 Mode Loop di server ini: **${mgr.isLoopQueue ? 'AKTIF' : 'NONAKTIF'}**`, flags: MessageFlags.Ephemeral });
     }
 
     if (interaction.customId === 'btn_player_stop') {
@@ -1031,7 +1133,7 @@ client.on('interactionCreate', async interaction => {
   }
 });
 
-// --- 10. LOGIN BOT ---
+// --- 9. LOGIN BOT ---
 console.log('🤖 Menghubungkan bot ke Discord...');
 client.login(process.env.DISCORD_TOKEN).catch(err => {
   console.error('❌ GAGAL LOGIN KE DISCORD! Periksa DISCORD_TOKEN atau Privileged Intents:', err.message);
